@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (generated files)
+data/audio/*
+data/transcripts/*
+data/cache/*
+data/logs/*
+
+# Keep data directory structure
+!data/**/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Models cache (downloaded models)
+models/
+*.pt
+*.bin
+*.onnx
+
+# Hugging Face cache
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Environment variables
+.env
+.env.local
+*.env
+
+# Temporary files
+tmp/
+temp/
+*.tmp
