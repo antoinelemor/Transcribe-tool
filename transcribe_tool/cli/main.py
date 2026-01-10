@@ -44,6 +44,12 @@ from ..transcriber.whisper_transcriber import TranscriptionConfig
 from ..transcriber.text_processor import TextProcessor
 from ..utils.language_detector import LanguageDetector, detect_language, get_language_name
 from ..utils.tokenizer import Tokenizer, segment_text, parse_segmentation_level
+from ..utils.document_loader import DocumentLoader, Document, LoaderResult
+from ..utils.text_tokenization import (
+    TextTokenizer, NLPFeatures, TokenizationResult,
+    format_tokenization_csv, format_tokenization_json,
+    get_available_nlp_features, get_supported_languages as get_nlp_languages
+)
 
 
 # Banner - Simple text version that always displays correctly
@@ -94,6 +100,8 @@ class TranscribeCLI:
                 elif choice == "5":
                     self._full_pipeline_workflow()
                 elif choice == "6":
+                    self._tokenization_workflow()
+                elif choice == "7":
                     self._settings_menu()
                 elif choice == "0":
                     self._exit()
@@ -217,13 +225,14 @@ class TranscribeCLI:
         menu_table.add_row("[3]", "Process local audio/video files")
         menu_table.add_row("[4]", "Transcribe audio files")
         menu_table.add_row("[5]", "[bold green]Full Pipeline[/bold green] (Extract → Transcribe → Export)")
-        menu_table.add_row("[6]", "Settings")
+        menu_table.add_row("[6]", "[bold magenta]Text Tokenization[/bold magenta] (Documents → SOTA NLP → CSV)")
+        menu_table.add_row("[7]", "Settings")
         menu_table.add_row("[0]", "Exit")
 
         self.console.print(menu_table)
         self.console.print()
 
-        return Prompt.ask("Select an option", choices=["0", "1", "2", "3", "4", "5", "6"], default="1")
+        return Prompt.ask("Select an option", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="1")
 
     def _youtube_workflow(self):
         """YouTube extraction workflow."""
@@ -1421,6 +1430,336 @@ class TranscribeCLI:
                 self.console.print(f"[green]Browser set to: {new_browser}[/green]")
             elif choice == "4":
                 self._manage_hf_token()
+
+    def _tokenization_workflow(self):
+        """Text tokenization workflow for documents."""
+        self.console.print(Panel(
+            "[bold magenta]Text Tokenization[/bold magenta]\n"
+            "[dim]SOTA NLP: Segmentation + Lemmatization + POS + NER → CSV/JSON[/dim]",
+            border_style="magenta"
+        ))
+
+        # Select input source
+        self.console.print("\n[bold]1. Input Source:[/bold]")
+        self.console.print("  [1] Single file (txt, pdf, docx, etc.)")
+        self.console.print("  [2] Directory of documents")
+        self.console.print("  [3] Paste text directly")
+        self.console.print("  [0] Back to menu")
+
+        source_choice = Prompt.ask("Select", choices=["0", "1", "2", "3"], default="1")
+
+        if source_choice == "0":
+            return
+
+        documents: List[Document] = []
+        loader = DocumentLoader(logger=self.logger)
+
+        if source_choice == "1":
+            # Single file
+            file_path = Prompt.ask("Enter file path")
+            if not file_path or not Path(file_path).exists():
+                self.console.print("[red]File not found[/red]")
+                return
+
+            self.console.print(f"[dim]Supported: {', '.join(loader.get_supported_formats())}[/dim]")
+
+            doc = loader.load(file_path)
+            if doc.success:
+                documents.append(doc)
+                self.console.print(f"[green]Loaded: {doc.path.name}[/green]")
+                self.console.print(f"  [dim]Words: {doc.word_count:,} | Chars: {doc.char_count:,}[/dim]")
+            else:
+                self.console.print(f"[red]Failed to load: {doc.error}[/red]")
+                return
+
+        elif source_choice == "2":
+            # Directory
+            directory = Prompt.ask("Enter directory path")
+            if not directory or not Path(directory).exists():
+                self.console.print("[red]Directory not found[/red]")
+                return
+
+            self.console.print("\n[bold]File Types:[/bold]")
+            self.console.print("  [1] All supported formats")
+            self.console.print("  [2] Text files only (.txt)")
+            self.console.print("  [3] PDF files only (.pdf)")
+            self.console.print("  [4] Word documents only (.docx)")
+            self.console.print("  [5] Custom extensions")
+
+            type_choice = Prompt.ask("Select", choices=["1", "2", "3", "4", "5"], default="1")
+
+            extensions = None
+            if type_choice == "2":
+                extensions = ['.txt']
+            elif type_choice == "3":
+                extensions = ['.pdf']
+            elif type_choice == "4":
+                extensions = ['.docx']
+            elif type_choice == "5":
+                ext_input = Prompt.ask("Enter extensions (comma-separated)", default=".txt,.pdf,.docx")
+                extensions = [e.strip() for e in ext_input.split(',')]
+
+            recursive = Confirm.ask("Search subdirectories?", default=True)
+
+            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=self.console) as progress:
+                task = progress.add_task("Loading documents...", total=None)
+                result = loader.load_directory(directory, recursive=recursive, extensions=extensions)
+                progress.update(task, completed=True)
+
+            documents = [d for d in result.documents if d.success]
+
+            self.console.print(f"\n[green]Loaded {result.successful}/{result.total_files} documents[/green]")
+            if not documents:
+                self.console.print("[red]No documents to process[/red]")
+                return
+
+            total_words = sum(d.word_count for d in documents)
+            self.console.print(f"[dim]Total words: {total_words:,}[/dim]")
+
+        elif source_choice == "3":
+            # Direct text input
+            self.console.print("\n[dim]Enter/paste text (press Enter twice to finish):[/dim]")
+
+            lines = []
+            empty_count = 0
+            while empty_count < 1:
+                try:
+                    line = input()
+                    if line == "":
+                        empty_count += 1
+                    else:
+                        empty_count = 0
+                        lines.append(line)
+                except EOFError:
+                    break
+
+            text = '\n'.join(lines)
+            if not text.strip():
+                self.console.print("[red]No text provided[/red]")
+                return
+
+            doc = loader.load_text(text, source_name="direct_input")
+            documents.append(doc)
+            self.console.print(f"[green]Text loaded: {doc.word_count:,} words[/green]")
+
+        if not documents:
+            return
+
+        # Language selection with auto-detection
+        self.console.print("\n[bold]2. Language:[/bold]")
+        languages = get_nlp_languages()
+
+        for i, lang in enumerate(languages[:10], 1):
+            self.console.print(f"  [{i:2}] {lang['name']} ({lang['code']})")
+        self.console.print("  [11] Auto-detect (recommended)")
+        self.console.print("  [12] Other (enter code)")
+
+        lang_choice = Prompt.ask("Select", default="11")
+
+        language = 'en'
+        if lang_choice == "11":
+            # Auto-detect using LanguageDetector
+            try:
+                detector = LanguageDetector()
+                sample_text = documents[0].content[:2000]
+                result = detector.detect(sample_text, return_all_scores=True)
+                language = result['language']
+                confidence = result['confidence']
+                method = result['method']
+                self.console.print(f"[green]Detected: {get_language_name(language)} ({language})[/green]")
+                self.console.print(f"  [dim]Confidence: {confidence:.1%} | Method: {method}[/dim]")
+            except Exception as e:
+                language = 'en'
+                self.console.print(f"[yellow]Detection failed ({e}), using English[/yellow]")
+        elif lang_choice == "12":
+            language = Prompt.ask("Enter language code (e.g., en, fr, de)", default="en")
+        elif lang_choice.isdigit() and 1 <= int(lang_choice) <= 10:
+            language = languages[int(lang_choice) - 1]['code']
+
+        # Segmentation level
+        self.console.print("\n[bold]3. Segmentation Level:[/bold]")
+        self.console.print("  [1] 1 sentence per segment")
+        self.console.print("  [2] 2 sentences per segment")
+        self.console.print("  [3] 3 sentences per segment")
+        self.console.print("  [4] Custom N sentences per segment")
+        self.console.print("  [0] Paragraph mode (keep paragraphs intact)")
+
+        seg_choice = Prompt.ask("Select", choices=["0", "1", "2", "3", "4"], default="1")
+
+        segmentation_level = 1
+        if seg_choice == "0":
+            segmentation_level = 0  # Paragraph mode
+        elif seg_choice == "1":
+            segmentation_level = 1
+        elif seg_choice == "2":
+            segmentation_level = 2
+        elif seg_choice == "3":
+            segmentation_level = 3
+        elif seg_choice == "4":
+            segmentation_level = IntPrompt.ask("Number of sentences per segment", default=5)
+
+        # NLP Features selection
+        self.console.print("\n[bold]4. NLP Features:[/bold] (select multiple with comma)")
+        self.console.print("  [1] Lemmatization (word base forms)")
+        self.console.print("  [2] POS Tagging (part-of-speech)")
+        self.console.print("  [3] NER (named entities: people, places, orgs)")
+        self.console.print("  [4] All features (lemma + POS + NER)")
+        self.console.print("  [0] None (text segmentation only)")
+
+        nlp_choice = Prompt.ask("Select", default="4")
+
+        lemmatization = False
+        pos_tagging = False
+        ner = False
+
+        if nlp_choice == "4":
+            lemmatization = pos_tagging = ner = True
+        elif nlp_choice != "0":
+            choices = [c.strip() for c in nlp_choice.split(',')]
+            if "1" in choices:
+                lemmatization = True
+            if "2" in choices:
+                pos_tagging = True
+            if "3" in choices:
+                ner = True
+
+        nlp_features = NLPFeatures(
+            lemmatization=lemmatization,
+            pos_tagging=pos_tagging,
+            ner=ner
+        )
+
+        # Show selected features
+        features_str = []
+        if lemmatization:
+            features_str.append("Lemma")
+        if pos_tagging:
+            features_str.append("POS")
+        if ner:
+            features_str.append("NER")
+        if features_str:
+            self.console.print(f"  [dim]Selected: {', '.join(features_str)}[/dim]")
+        else:
+            self.console.print("  [dim]Selected: Segmentation only[/dim]")
+
+        # Output format
+        self.console.print("\n[bold]5. Output Format:[/bold]")
+        self.console.print("  [1] CSV (with JSON-encoded structured data)")
+        self.console.print("  [2] JSON (full structured export)")
+
+        format_choice = Prompt.ask("Select", choices=["1", "2"], default="1")
+        output_format = "csv" if format_choice == "1" else "json"
+
+        # Process documents
+        self.console.print(f"\n[bold]Processing {len(documents)} document(s)...[/bold]")
+
+        # Initialize tokenizer
+        tokenizer = TextTokenizer(
+            language=language,
+            segmentation_level=segmentation_level,
+            nlp_features=nlp_features,
+            use_gpu=True,
+            logger=self.logger
+        )
+
+        results: List[TokenizationResult] = []
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=self.console
+        ) as progress:
+            task = progress.add_task("Tokenizing...", total=len(documents))
+
+            for idx, doc in enumerate(documents, 1):
+                doc_id = doc.path.stem if doc.path else f"doc_{idx}"
+                progress.update(task, description=f"Processing {doc_id}...")
+
+                result = tokenizer.tokenize(
+                    text=doc.content,
+                    document_id=doc_id,
+                    source_file=str(doc.path) if doc.path else None
+                )
+                results.append(result)
+                progress.update(task, advance=1)
+
+        # Summary
+        successful_results = [r for r in results if r.success]
+        total_segments = sum(len(r.segments) for r in successful_results)
+        total_sentences = sum(r.total_sentences for r in successful_results)
+        total_words = sum(r.total_words for r in successful_results)
+        total_entities = sum(r.total_entities for r in successful_results)
+        failed = len(results) - len(successful_results)
+
+        self.console.print(f"\n[green]Tokenization complete![/green]")
+        self.console.print(f"  Documents: {len(successful_results)}/{len(results)}")
+        self.console.print(f"  Segments: {total_segments:,}")
+        self.console.print(f"  Sentences: {total_sentences:,}")
+        self.console.print(f"  Words: {total_words:,}")
+        if ner and total_entities > 0:
+            self.console.print(f"  Entities: {total_entities:,}")
+
+        # Generate output
+        if output_format == "csv":
+            output_content = format_tokenization_csv(results)
+            ext = "csv"
+        else:
+            output_content = format_tokenization_json(results)
+            ext = "json"
+
+        # Save output
+        output_dir = self.config.transcripts_dir / "tokenization"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if len(documents) == 1 and documents[0].path:
+            base_name = documents[0].path.stem
+        else:
+            base_name = f"tokenized_{len(documents)}_docs"
+
+        seg_str = f"seg{segmentation_level}" if segmentation_level > 0 else "para"
+        output_path = output_dir / f"{base_name}_{language}_{seg_str}_{timestamp}.{ext}"
+        output_path.write_text(output_content, encoding='utf-8')
+
+        self.console.print(f"\n[green]Output saved to:[/green] {output_path}")
+
+        # Show preview
+        if Confirm.ask("Show preview?", default=True):
+            if successful_results:
+                preview_table = Table(title="Preview (first 10 segments)", box=box.ROUNDED)
+                preview_table.add_column("ID", style="cyan", width=4)
+                preview_table.add_column("Doc", style="magenta", width=15)
+                preview_table.add_column("Text", style="white", max_width=50)
+                preview_table.add_column("Sent", style="yellow", width=4)
+                preview_table.add_column("Words", style="green", width=5)
+                if ner:
+                    preview_table.add_column("Entities", style="blue", width=6)
+
+                segment_count = 0
+                for result in successful_results:
+                    for seg in result.segments:
+                        if segment_count >= 10:
+                            break
+                        text_preview = seg.text[:60] + "..." if len(seg.text) > 60 else seg.text
+                        row = [
+                            str(seg.segment_id),
+                            seg.document_id[:15],
+                            text_preview,
+                            str(seg.sentence_count),
+                            str(seg.word_count)
+                        ]
+                        if ner:
+                            row.append(str(len(seg.entities)))
+                        preview_table.add_row(*row)
+                        segment_count += 1
+                    if segment_count >= 10:
+                        break
+
+                self.console.print(preview_table)
 
     def _manage_hf_token(self):
         """Manage HuggingFace token storage."""
