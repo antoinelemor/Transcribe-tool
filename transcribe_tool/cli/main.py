@@ -709,46 +709,133 @@ class TranscribeCLI:
 
         return result
 
+    def _get_config_file_path(self) -> Path:
+        """Get path to config file for fallback token storage."""
+        config_dir = Path.home() / ".transcribe-tool"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir / "config.json"
+
+    def _get_token_from_file(self) -> Optional[str]:
+        """Get HuggingFace token from config file (fallback)."""
+        try:
+            config_path = self._get_config_file_path()
+            if config_path.exists():
+                import json
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                return config.get('hf_token')
+        except Exception:
+            pass
+        return None
+
+    def _save_token_to_file(self, token: str) -> bool:
+        """Save HuggingFace token to config file (fallback)."""
+        try:
+            config_path = self._get_config_file_path()
+            import json
+
+            # Load existing config or create new
+            config = {}
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                except Exception:
+                    pass
+
+            config['hf_token'] = token
+
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            # Set restrictive permissions (owner read/write only)
+            config_path.chmod(0o600)
+            return True
+        except Exception as e:
+            self.logger.warning(f"Could not save token to file: {e}")
+            return False
+
+    def _delete_token_from_file(self) -> bool:
+        """Delete HuggingFace token from config file."""
+        try:
+            config_path = self._get_config_file_path()
+            if config_path.exists():
+                import json
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                if 'hf_token' in config:
+                    del config['hf_token']
+                    with open(config_path, 'w') as f:
+                        json.dump(config, f, indent=2)
+            return True
+        except Exception:
+            return False
+
     def _get_hf_token_from_keyring(self) -> Optional[str]:
-        """Get HuggingFace token from system keychain."""
+        """Get HuggingFace token from system keychain or config file."""
+        # Try keyring first
         try:
             import keyring
             token = keyring.get_password("transcribe-tool", "hf_token")
-            return token
-        except Exception:
-            return None
+            if token:
+                return token
+        except ImportError:
+            self.logger.debug("keyring not available")
+        except Exception as e:
+            self.logger.debug(f"keyring error: {e}")
+
+        # Fallback to config file
+        return self._get_token_from_file()
 
     def _save_hf_token_to_keyring(self, token: str) -> bool:
-        """Save HuggingFace token to system keychain."""
+        """Save HuggingFace token to system keychain or config file."""
+        saved_to_keyring = False
+
+        # Try keyring first
         try:
             import keyring
             keyring.set_password("transcribe-tool", "hf_token", token)
-            return True
+            saved_to_keyring = True
+        except ImportError:
+            self.logger.debug("keyring not available, using config file")
         except Exception as e:
-            self.logger.warning(f"Could not save token to keychain: {e}")
-            return False
+            self.logger.debug(f"keyring save error: {e}, using config file")
+
+        # Always also save to file as backup
+        saved_to_file = self._save_token_to_file(token)
+
+        return saved_to_keyring or saved_to_file
 
     def _delete_hf_token_from_keyring(self) -> bool:
-        """Delete HuggingFace token from system keychain."""
+        """Delete HuggingFace token from system keychain and config file."""
+        deleted_keyring = False
+        deleted_file = False
+
+        # Try to delete from keyring
         try:
             import keyring
             keyring.delete_password("transcribe-tool", "hf_token")
-            return True
+            deleted_keyring = True
         except Exception:
-            return False
+            pass
+
+        # Also delete from config file
+        deleted_file = self._delete_token_from_file()
+
+        return deleted_keyring or deleted_file
 
     def _get_hf_token(self) -> Optional[str]:
-        """Get HuggingFace token from keychain, environment, or user input."""
+        """Get HuggingFace token from keychain, config file, environment, or user input."""
         # 1. First check environment variable
         token = os.getenv("HF_TOKEN")
         if token:
             self.console.print("[dim]Using HF_TOKEN from environment[/dim]")
             return token
 
-        # 2. Check system keychain
+        # 2. Check system keychain / config file
         token = self._get_hf_token_from_keyring()
         if token:
-            self.console.print("[dim]Using HuggingFace token from system keychain[/dim]")
+            self.console.print("[dim]Using saved HuggingFace token[/dim]")
             return token
 
         # 3. Ask user for token
@@ -761,14 +848,14 @@ class TranscribeCLI:
         token = Prompt.ask("Enter HuggingFace token (or press Enter to skip)", default="", password=True)
 
         if token and token.startswith("hf_"):
-            # Offer to save permanently to keychain
-            if Confirm.ask("Save token permanently to system keychain?", default=True):
+            # Offer to save permanently
+            if Confirm.ask("Save token for future sessions?", default=True):
                 if self._save_hf_token_to_keyring(token):
-                    self.console.print("[green]Token saved to system keychain (macOS Keychain)[/green]")
+                    self.console.print("[green]Token saved successfully[/green]")
                 else:
                     # Fallback to session only
                     os.environ["HF_TOKEN"] = token
-                    self.console.print("[yellow]Could not save to keychain, saved for this session only[/yellow]")
+                    self.console.print("[yellow]Could not save token, using for this session only[/yellow]")
             else:
                 os.environ["HF_TOKEN"] = token
                 self.console.print("[dim]Token saved for this session only[/dim]")
@@ -1766,11 +1853,13 @@ class TranscribeCLI:
         self.console.print("\n[bold]HuggingFace Token Management[/bold]")
 
         # Check current status
-        keyring_token = self._get_hf_token_from_keyring()
+        saved_token = self._get_hf_token_from_keyring()
         env_token = os.getenv("HF_TOKEN")
 
-        if keyring_token:
-            self.console.print(f"[green]Token saved in keychain:[/green] hf_...{keyring_token[-4:]}")
+        if saved_token:
+            self.console.print(f"[green]Token saved:[/green] hf_...{saved_token[-4:]}")
+            config_path = self._get_config_file_path()
+            self.console.print(f"[dim]Storage: {config_path}[/dim]")
         elif env_token:
             self.console.print(f"[yellow]Token from environment:[/yellow] hf_...{env_token[-4:]}")
         else:
@@ -1788,16 +1877,16 @@ class TranscribeCLI:
             token = Prompt.ask("Enter HuggingFace token", password=True)
             if token and token.startswith("hf_"):
                 if self._save_hf_token_to_keyring(token):
-                    self.console.print("[green]Token saved to system keychain[/green]")
+                    self.console.print("[green]Token saved successfully[/green]")
                 else:
                     self.console.print("[red]Failed to save token[/red]")
             elif token:
                 self.console.print("[yellow]Invalid token format (should start with 'hf_')[/yellow]")
         elif choice == "2":
-            if keyring_token:
-                if Confirm.ask("Delete saved token from keychain?", default=False):
+            if saved_token:
+                if Confirm.ask("Delete saved token?", default=False):
                     if self._delete_hf_token_from_keyring():
-                        self.console.print("[green]Token deleted from keychain[/green]")
+                        self.console.print("[green]Token deleted[/green]")
                     else:
                         self.console.print("[red]Failed to delete token[/red]")
             else:
