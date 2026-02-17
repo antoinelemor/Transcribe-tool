@@ -44,10 +44,11 @@ from ..transcriber.whisper_transcriber import TranscriptionConfig
 from ..transcriber.text_processor import TextProcessor
 from ..utils.language_detector import LanguageDetector, detect_language, get_language_name
 from ..utils.tokenizer import Tokenizer, segment_text, parse_segmentation_level
-from ..utils.document_loader import DocumentLoader, Document, LoaderResult
+from ..utils.document_loader import DocumentLoader, Document, DocumentFormat, LoaderResult
 from ..utils.text_tokenization import (
     TextTokenizer, NLPFeatures, TokenizationResult,
     format_tokenization_csv, format_tokenization_json,
+    tokenize_dataframe, format_tokenization_rds,
     get_available_nlp_features, get_supported_languages as get_nlp_languages
 )
 
@@ -1552,6 +1553,11 @@ class TranscribeCLI:
 
             doc = loader.load(file_path)
             if doc.success:
+                # RDS files get a dedicated workflow
+                if doc.format == DocumentFormat.RDS:
+                    self._tokenization_rds_workflow(doc)
+                    return
+
                 documents.append(doc)
                 self.console.print(f"[green]Loaded: {doc.path.name}[/green]")
                 self.console.print(f"  [dim]Words: {doc.word_count:,} | Chars: {doc.char_count:,}[/dim]")
@@ -1847,6 +1853,260 @@ class TranscribeCLI:
                         break
 
                 self.console.print(preview_table)
+
+    def _tokenization_rds_workflow(self, doc: Document):
+        """Dedicated tokenization workflow for RDS files (DataFrames)."""
+        df = doc.metadata['dataframe']
+        columns = doc.metadata['columns']
+        shape = doc.metadata['shape']
+        text_col = doc.metadata['text_column']
+        text_candidates = doc.metadata['text_candidates']
+        lang_col = doc.metadata['lang_column']
+        lang_candidates = doc.metadata.get('lang_candidates', [])
+
+        self.console.print(f"[green]Loaded RDS: {doc.path.name}[/green]")
+        self.console.print(f"  [dim]DataFrame: {shape[0]:,} rows × {shape[1]} columns[/dim]")
+
+        # --- Text column selection ---
+        self.console.print(f"\n[bold]1. Text Column:[/bold]")
+
+        # Show numbered list of all columns
+        for i, col in enumerate(columns, 1):
+            marker = " [green](recommended)[/green]" if col == text_col else ""
+            self.console.print(f"  [{i:2}] {col}{marker}")
+
+        default_idx = str(columns.index(text_col) + 1) if text_col in columns else "1"
+        col_choice = Prompt.ask("Select text column", default=default_idx)
+
+        if col_choice.isdigit() and 1 <= int(col_choice) <= len(columns):
+            text_col = columns[int(col_choice) - 1]
+        elif col_choice in columns:
+            text_col = col_choice
+        else:
+            self.console.print(f"[red]Invalid choice '{col_choice}'[/red]")
+            return
+
+        # Preview text column
+        sample_values = df[text_col].dropna().head(3).astype(str).tolist()
+        self.console.print(f"  [dim]Selected: [bold]{text_col}[/bold] — Preview:[/dim]")
+        for j, val in enumerate(sample_values, 1):
+            preview = val[:80] + "..." if len(val) > 80 else val
+            self.console.print(f"    {j}. {preview}")
+
+        # --- Language column selection ---
+        self.console.print(f"\n[bold]2. Language:[/bold]")
+
+        use_lang_column = False
+        default_language = 'fr'
+
+        # Show options: use a column or specify a single language
+        lang_col_options = [c for c in columns
+                            if any(h in c.lower() for h in ['lang', 'language', 'locale', 'idiom'])]
+
+        self.console.print("  [0] Single language for all rows")
+        for i, col in enumerate(lang_col_options, 1):
+            marker = " [green](recommended)[/green]" if col == lang_col else ""
+            # Show unique values preview
+            unique_vals = df[col].dropna().unique()
+            preview = ', '.join(str(v) for v in unique_vals[:5])
+            self.console.print(f"  [{i}] Use column [bold]{col}[/bold] — values: {preview}{marker}")
+
+        if not lang_col_options:
+            self.console.print("  [dim]No language column detected in DataFrame[/dim]")
+
+        default_lang_choice = "0"
+        if lang_col and lang_col in lang_col_options:
+            default_lang_choice = str(lang_col_options.index(lang_col) + 1)
+
+        lang_choice = Prompt.ask("Select", default=default_lang_choice)
+
+        if lang_choice != "0" and lang_choice.isdigit() and 1 <= int(lang_choice) <= len(lang_col_options):
+            lang_col = lang_col_options[int(lang_choice) - 1]
+            use_lang_column = True
+            self.console.print(f"  [dim]Using per-row language from [bold]{lang_col}[/bold][/dim]")
+        else:
+            lang_col = None
+            languages = get_nlp_languages()
+            for i, lang in enumerate(languages[:10], 1):
+                self.console.print(f"  [{i:2}] {lang['name']} ({lang['code']})")
+            self.console.print("  [11] Other (enter code)")
+
+            lang_input = Prompt.ask("Select language", default="1")
+            if lang_input == "11":
+                default_language = Prompt.ask("Enter language code", default="fr")
+            elif lang_input.isdigit() and 1 <= int(lang_input) <= 10:
+                default_language = languages[int(lang_input) - 1]['code']
+
+        # --- NLP Features ---
+        self.console.print("\n[bold]3. NLP Features:[/bold] (select multiple with comma)")
+        self.console.print("  [1] Lemmatization (word base forms)")
+        self.console.print("  [2] POS Tagging (part-of-speech)")
+        self.console.print("  [3] NER (named entities)")
+        self.console.print("  [4] All features")
+        self.console.print("  [0] None (text segmentation only)")
+
+        nlp_choice = Prompt.ask("Select", default="4")
+
+        lemmatization = pos_tagging = ner = False
+        if nlp_choice == "4":
+            lemmatization = pos_tagging = ner = True
+        elif nlp_choice != "0":
+            choices = [c.strip() for c in nlp_choice.split(',')]
+            if "1" in choices:
+                lemmatization = True
+            if "2" in choices:
+                pos_tagging = True
+            if "3" in choices:
+                ner = True
+
+        nlp_features = NLPFeatures(
+            lemmatization=lemmatization,
+            pos_tagging=pos_tagging,
+            ner=ner
+        )
+
+        features_str = []
+        if lemmatization: features_str.append("Lemma")
+        if pos_tagging: features_str.append("POS")
+        if ner: features_str.append("NER")
+        self.console.print(f"  [dim]Selected: {', '.join(features_str) if features_str else 'Segmentation only'}[/dim]")
+
+        # --- Sentence IDs ---
+        sentence_id_prefix = None
+
+        self.console.print("\n[bold]4. Sentence IDs:[/bold]")
+        self.console.print("  [1] Automatic (global incremental: 1, 2, 3...)")
+        self.console.print("  [2] From column(s) (concatenated values + sequence number)")
+
+        id_choice = Prompt.ask("Select", choices=["1", "2"], default="1")
+
+        if id_choice == "2":
+            id_configured = False
+            while not id_configured:
+                self.console.print("\n[dim]Select column(s) for ID prefix (comma-separated numbers):[/dim]")
+                for i, col in enumerate(columns, 1):
+                    sample = str(df[col].dropna().iloc[0])[:30] if len(df[col].dropna()) > 0 else "N/A"
+                    self.console.print(f"  [{i:2}] {col}  [dim]({sample})[/dim]")
+
+                col_input = Prompt.ask("Select column(s)")
+                selected_cols = []
+                for c in col_input.split(','):
+                    c = c.strip()
+                    if c.isdigit() and 1 <= int(c) <= len(columns):
+                        selected_cols.append(columns[int(c) - 1])
+                    elif c in columns:
+                        selected_cols.append(c)
+
+                if not selected_cols:
+                    self.console.print("[red]No valid columns selected[/red]")
+                    continue
+
+                self.console.print(f"  [dim]Selected: {', '.join(selected_cols)}[/dim]")
+
+                # Compute uniqueness
+                combo = df[selected_cols].astype(str).agg('_'.join, axis=1)
+                n_unique = combo.nunique()
+                n_rows = len(combo)
+                pct = n_unique / n_rows * 100
+
+                self.console.print(f"  Uniqueness: {n_unique:,} unique / {n_rows:,} rows ({pct:.1f}%)")
+
+                if pct < 100:
+                    self.console.print(f"  [yellow]Warning: combination is not unique — sentences from different rows will share the same prefix.[/yellow]")
+                    if not Confirm.ask("  Continue with this selection?", default=True):
+                        continue
+
+                # Build prefix_map
+                valid_indices_set = set(df.index[df[text_col].notna() & df[text_col].astype(str).str.strip().astype(bool)])
+                sentence_id_prefix = {}
+                for idx in range(len(df)):
+                    if idx in valid_indices_set:
+                        sentence_id_prefix[idx] = combo.iloc[idx]
+
+                # Preview
+                sample_prefixes = list(sentence_id_prefix.values())[:3]
+                self.console.print(f"  [dim]ID preview: {sample_prefixes[0]}_1, {sample_prefixes[0]}_2, ...[/dim]" if sample_prefixes else "")
+                id_configured = True
+        else:
+            self.console.print("  [dim]IDs: 1, 2, 3, ...[/dim]")
+
+        # --- Output format ---
+        self.console.print("\n[bold]5. Output Format:[/bold]")
+        self.console.print("  [1] CSV")
+        self.console.print("  [2] JSON")
+        self.console.print("  [3] RDS (same format, enriched with tk_* columns)")
+
+        format_choice = Prompt.ask("Select", choices=["1", "2", "3"], default="3")
+        format_map = {"1": "csv", "2": "json", "3": "rds"}
+        output_format = format_map[format_choice]
+
+        # --- Process ---
+        self.console.print(f"\n[bold]Processing {shape[0]:,} rows...[/bold]")
+
+        result_df = tokenize_dataframe(
+            df=df,
+            text_column=text_col,
+            lang_column=lang_col if use_lang_column else None,
+            default_language=default_language,
+            nlp_features=nlp_features,
+            segmentation_level=1,
+            use_gpu=True,
+            logger=self.logger,
+            show_progress=True,
+            sentence_id_prefix=sentence_id_prefix,
+        )
+
+        # Summary stats
+        total_sentences = result_df['tk_sentence_count'].sum()
+        total_words = result_df['tk_word_count'].sum()
+        non_empty = (result_df['tk_sentence_count'] > 0).sum()
+
+        self.console.print(f"\n[green]Tokenization complete![/green]")
+        self.console.print(f"  Rows processed: {non_empty:,}/{shape[0]:,}")
+        self.console.print(f"  Total sentences: {int(total_sentences):,}")
+        self.console.print(f"  Total words: {int(total_words):,}")
+        self.console.print(f"  New columns: {', '.join(c for c in result_df.columns if c.startswith('tk_'))}")
+
+        # --- Save output ---
+        output_dir = self.config.transcripts_dir / "tokenization"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = doc.path.stem
+
+        if output_format == "rds":
+            output_path = output_dir / f"{base_name}_tokenized_{timestamp}.rds"
+            self.console.print(f"\n[dim]Writing RDS file...[/dim]")
+            format_tokenization_rds(result_df, str(output_path))
+        elif output_format == "csv":
+            output_path = output_dir / f"{base_name}_tokenized_{timestamp}.csv"
+            result_df.to_csv(str(output_path), index=False, encoding='utf-8')
+        elif output_format == "json":
+            output_path = output_dir / f"{base_name}_tokenized_{timestamp}.json"
+            result_df.to_json(str(output_path), orient='records', force_ascii=False, indent=2)
+
+        self.console.print(f"[green]Output saved to:[/green] {output_path}")
+
+        # Show preview
+        if Confirm.ask("Show preview?", default=True):
+            preview_cols = [text_col, 'tk_sentence_count', 'tk_word_count']
+            if lang_col and use_lang_column:
+                preview_cols.insert(1, lang_col)
+
+            preview_table = Table(title="Preview (first 5 rows)", box=box.ROUNDED)
+            for col in preview_cols:
+                preview_table.add_column(col, style="white", max_width=40)
+
+            for _, row in result_df.head(5).iterrows():
+                row_data = []
+                for col in preview_cols:
+                    val = str(row[col])
+                    if len(val) > 40:
+                        val = val[:37] + "..."
+                    row_data.append(val)
+                preview_table.add_row(*row_data)
+
+            self.console.print(preview_table)
 
     def _manage_hf_token(self):
         """Manage HuggingFace token storage."""
