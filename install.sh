@@ -201,7 +201,24 @@ if [ "$INSTALL_TYPE" == "full" ]; then
     echo "  Installing with full features (this may take a few minutes)..."
     pip install -e ".[full]"
 elif [ "$INSTALL_TYPE" == "dev" ]; then
+    echo "  Installing in editable mode for development..."
     pip install -e ".[dev]"
+    # Python >=3.13 skips .pth files starting with __ (treats them as hidden),
+    # which breaks setuptools editable installs. Fix by renaming the files.
+    if [ "$PYTHON_MINOR" -ge 13 ]; then
+        SITE_PACKAGES="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+        PTH_FILE="$SITE_PACKAGES/__editable__.transcribe_tool-1.0.0.pth"
+        FINDER_FILE="$SITE_PACKAGES/__editable___transcribe_tool_1_0_0_finder.py"
+        if [ -f "$PTH_FILE" ]; then
+            NEW_PTH="$SITE_PACKAGES/editable-transcribe_tool-1.0.0.pth"
+            NEW_FINDER="$SITE_PACKAGES/editable_transcribe_tool_1_0_0_finder.py"
+            mv "$PTH_FILE" "$NEW_PTH"
+            mv "$FINDER_FILE" "$NEW_FINDER"
+            sed -i '' 's/__editable___transcribe_tool_1_0_0_finder/editable_transcribe_tool_1_0_0_finder/g' "$NEW_PTH"
+            sed -i '' 's/__editable__.transcribe_tool-1.0.0.finder/editable.transcribe_tool-1.0.0.finder/g' "$NEW_FINDER"
+            echo -e "  ${GREEN}✓ Applied Python 3.13+ editable install fix${NC}"
+        fi
+    fi
 else
     pip install -e .
 fi
@@ -216,6 +233,9 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 python -m spacy download en_core_web_sm 2>/dev/null && echo -e "  ${GREEN}✓ English spaCy model installed${NC}" || echo -e "  ${YELLOW}- English model not installed (optional)${NC}"
 python -m spacy download fr_core_news_sm 2>/dev/null && echo -e "  ${GREEN}✓ French spaCy model installed${NC}" || echo -e "  ${YELLOW}- French model not installed (optional)${NC}"
+python -c "from wtpsplit import SaT; SaT('sat-12l'); print('OK')" 2>/dev/null \
+    && echo -e "  ${GREEN}✓ wtpsplit sat-12l model downloaded${NC}" \
+    || echo -e "  ${YELLOW}- wtpsplit model not downloaded (optional)${NC}"
 echo ""
 
 # Verify installation
