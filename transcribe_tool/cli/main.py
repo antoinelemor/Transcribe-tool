@@ -2013,8 +2013,19 @@ class TranscribeCLI:
 
                 if pct < 100:
                     self.console.print(f"  [yellow]Warning: combination is not unique — sentences from different rows will share the same prefix.[/yellow]")
-                    if not Confirm.ask("  Continue with this selection?", default=True):
+                    self.console.print("  [1] Continue anyway (non-unique prefixes)")
+                    self.console.print("  [2] Add _idx suffix to make unique (e.g. prefix_1, prefix_2 for duplicates)")
+                    self.console.print("  [3] Re-select columns")
+
+                    fix_choice = Prompt.ask("  Select", choices=["1", "2", "3"], default="2")
+
+                    if fix_choice == "3":
                         continue
+                    elif fix_choice == "2":
+                        # Add per-group incremental _idx suffix
+                        combo = combo + '_' + combo.groupby(combo).cumcount().add(1).astype(str)
+                        n_unique_after = combo.nunique()
+                        self.console.print(f"  [green]After _idx: {n_unique_after:,} unique / {n_rows:,} rows (100.0%)[/green]")
 
                 # Build prefix_map
                 valid_indices_set = set(df.index[df[text_col].notna() & df[text_col].astype(str).str.strip().astype(bool)])
