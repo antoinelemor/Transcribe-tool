@@ -116,7 +116,7 @@ class Tokenizer:
         if HAS_WTPSPLIT:
             try:
                 if _wtp_model is None:
-                    _wtp_model = SaT("sat-3l")
+                    _wtp_model = SaT("sat-12l")
                     # Move to GPU if available
                     try:
                         import torch
@@ -142,7 +142,7 @@ class Tokenizer:
 
                 for model_name in models_to_try:
                     try:
-                        self.nlp = spacy.load(model_name, disable=['ner'])
+                        self.nlp = spacy.load(model_name, disable=["parser", "senter"])
                         _spacy_cache[self.language] = self.nlp
                         break
                     except OSError:
@@ -175,7 +175,7 @@ class Tokenizer:
         # Try wtpsplit first (SOTA)
         if self.wtp is not None:
             try:
-                sentences = self.wtp.split(text, language=self.language)
+                sentences = self.wtp.split(text)
                 sentences = [s.strip() for s in sentences if s.strip()]
             except Exception:
                 sentences = None

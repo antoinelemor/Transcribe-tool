@@ -10,6 +10,7 @@ Supports loading text from multiple document formats:
 - HTML (.html, .htm) - Web pages with tags stripped
 - EPUB (.epub) - E-books
 - ODT (.odt) - OpenDocument text
+- RDS (.rds) - R data files (DataFrames) via pyreadr
 """
 
 import re
@@ -32,6 +33,7 @@ class DocumentFormat(Enum):
     HTM = "htm"
     EPUB = "epub"
     ODT = "odt"
+    RDS = "rds"
     UNKNOWN = "unknown"
 
 
@@ -88,6 +90,7 @@ class DocumentLoader:
         '.htm': DocumentFormat.HTM,
         '.epub': DocumentFormat.EPUB,
         '.odt': DocumentFormat.ODT,
+        '.rds': DocumentFormat.RDS,
     }
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -104,6 +107,7 @@ class DocumentLoader:
         self.has_ebooklib = False
         self.has_odfpy = False
         self.has_striprtf = False
+        self.has_pyreadr = False
 
         try:
             import pdfplumber
@@ -154,6 +158,12 @@ class DocumentLoader:
         try:
             from striprtf.striprtf import rtf_to_text
             self.has_striprtf = True
+        except ImportError:
+            pass
+
+        try:
+            import pyreadr
+            self.has_pyreadr = True
         except ImportError:
             pass
 
@@ -211,6 +221,8 @@ class DocumentLoader:
                 return self._load_epub(path)
             elif doc_format == DocumentFormat.ODT:
                 return self._load_odt(path)
+            elif doc_format == DocumentFormat.RDS:
+                return self._load_rds(path)
             else:
                 # Try as plain text
                 return self._load_txt(path)
@@ -682,6 +694,77 @@ class DocumentLoader:
                 content="",
                 path=path,
                 format=DocumentFormat.ODT,
+                success=False,
+                error=str(e)
+            )
+
+    def _load_rds(self, path: Path) -> Document:
+        """Load R data file (.rds) containing a DataFrame."""
+        if not self.has_pyreadr:
+            return Document(
+                content="",
+                path=path,
+                format=DocumentFormat.RDS,
+                success=False,
+                error="pyreadr not installed. Install: pip install pyreadr"
+            )
+
+        try:
+            import pyreadr
+
+            result = pyreadr.read_r(str(path))
+            df = list(result.values())[0]
+
+            # Auto-detect text column candidates
+            # Priority 1: columns ending with _text or named exactly 'text'
+            # Priority 2: columns containing text-related hints
+            TEXT_EXACT = ['text', 'content', 'body']
+            TEXT_SUFFIX = ['_text', '_content', '_body', '_message', '_speech']
+            TEXT_HINTS = ['text', 'content', 'body', 'message', 'speech',
+                          'paragraph', 'sentence']
+
+            # Find best candidates with priority ordering
+            exact_matches = [c for c in df.columns if c.lower() in TEXT_EXACT]
+            suffix_matches = [c for c in df.columns
+                              if any(c.lower().endswith(s) for s in TEXT_SUFFIX)]
+            hint_matches = [c for c in df.columns
+                            if any(h in c.lower() for h in TEXT_HINTS)
+                            and c not in exact_matches and c not in suffix_matches]
+
+            text_candidates = exact_matches + suffix_matches + hint_matches
+            text_col = text_candidates[0] if text_candidates else df.columns[0]
+
+            # Auto-detect language column candidates
+            LANG_HINTS = ['lang', 'language', 'locale', 'idiom']
+            lang_candidates = [c for c in df.columns
+                               if any(h in c.lower() for h in LANG_HINTS)]
+            lang_col = lang_candidates[0] if lang_candidates else None
+
+            # Use first few rows for content preview (not full concat — too large)
+            sample = df[text_col].dropna().head(100).astype(str)
+            content = '\n'.join(sample)
+
+            return Document(
+                content=content,
+                path=path,
+                format=DocumentFormat.RDS,
+                word_count=len(content.split()),
+                char_count=len(content),
+                metadata={
+                    'dataframe': df,
+                    'text_column': text_col,
+                    'text_candidates': text_candidates,
+                    'lang_column': lang_col,
+                    'lang_candidates': lang_candidates,
+                    'shape': df.shape,
+                    'columns': list(df.columns)
+                }
+            )
+        except Exception as e:
+            return Document(
+                content="",
+                path=path,
+                format=DocumentFormat.RDS,
                 success=False,
                 error=str(e)
             )

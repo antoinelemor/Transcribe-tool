@@ -43,6 +43,7 @@ Thumbs.db
 # Data (generated files)
 data/audio/*
 data/transcripts/*
+data/raw/*
 data/cache/*
 data/logs/*
 

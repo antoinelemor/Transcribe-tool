@@ -519,9 +519,8 @@ class TextProcessor:
 
             # SaT (Segment any Text) - SOTA model for sentence segmentation
             # Uses a transformer architecture trained on diverse multilingual data
-            # "sat-3l" is the best balance of speed/accuracy
-            # For maximum accuracy, use "sat-12l" (slower but more precise)
-            cls._wtp_model = SaT("sat-3l")
+            # "sat-12l" provides best accuracy with fast batch inference on MPS/CUDA
+            cls._wtp_model = SaT("sat-12l")
 
             # Move to GPU if available for faster inference
             try:
@@ -571,7 +570,7 @@ class TextProcessor:
         nlp = None
         for model_name in models_to_try:
             try:
-                nlp = spacy.load(model_name, disable=['ner'])
+                nlp = spacy.load(model_name, disable=["parser", "senter", "ner"])
                 break
             except OSError:
                 continue
@@ -611,7 +610,7 @@ class TextProcessor:
         if wtp is not None:
             try:
                 # wtpsplit returns list of sentences directly
-                sentences = wtp.split(text, language=language)
+                sentences = wtp.split(text)
                 sentences = [s.strip() for s in sentences if s.strip()]
             except Exception:
                 sentences = None
