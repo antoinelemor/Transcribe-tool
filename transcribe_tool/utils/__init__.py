@@ -19,8 +19,10 @@ from .text_tokenization import (
     TokenizationResult,
     TokenizedSegment,
     tokenize_text,
+    tokenize_dataframe,
     format_tokenization_csv,
     format_tokenization_json,
+    format_tokenization_rds,
     get_available_nlp_features,
     get_supported_languages,
 )
@@ -51,8 +53,10 @@ __all__ = [
     "TokenizationResult",
     "TokenizedSegment",
     "tokenize_text",
+    "tokenize_dataframe",
     "format_tokenization_csv",
     "format_tokenization_json",
+    "format_tokenization_rds",
     "get_available_nlp_features",
     "get_supported_languages",
 ]
