@@ -22,9 +22,18 @@ import sys
 import argparse
 from pathlib import Path
 
+from .utils.platform_compat import (
+    configure_stdio,
+    load_saved_hf_token,
+    safe_output_path,
+    write_csv_text,
+)
+
 
 def main():
     """Main entry point for Transcribe Tool."""
+    configure_stdio()
+
     parser = argparse.ArgumentParser(
         prog='transcribe-tool',
         description='Unified audio extraction and transcription tool',
@@ -95,6 +104,12 @@ For more information, visit: https://github.com/antoine-lemor/Transcribe-tool
         '--diarize',
         action='store_true',
         help='Enable speaker diarization'
+    )
+    parser.add_argument(
+        '--hf-token',
+        metavar='TOKEN',
+        help='HuggingFace token for diarization (takes precedence over the '
+             'HF_TOKEN environment variable and the token saved in Settings)'
     )
     parser.add_argument(
         '--cookies',
@@ -268,7 +283,8 @@ def _transcribe_file(audio_path: Path, args, logger):
                 import os
                 from .transcriber.diarization import SpeakerDiarizer, DiarizationConfig
 
-                diar_config = DiarizationConfig(hf_token=os.getenv("HF_TOKEN"))
+                hf_token = args.hf_token or os.getenv("HF_TOKEN") or load_saved_hf_token()
+                diar_config = DiarizationConfig(hf_token=hf_token)
                 diarizer = SpeakerDiarizer(config=diar_config, logger=logger)
 
                 print("Running speaker diarization...")
@@ -291,7 +307,7 @@ def _transcribe_file(audio_path: Path, args, logger):
         # Save output
         output_dir = Path(args.output) if args.output else config.transcripts_dir
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{audio_path.stem}.{args.format}"
+        output_path = safe_output_path(output_dir, audio_path.stem, f".{args.format}")
 
         # Extract metadata from filename
         import re
@@ -329,7 +345,7 @@ def _transcribe_file(audio_path: Path, args, logger):
                 segmentation_level='sentence',
                 language=result.language
             )
-            output_path.write_text(content, encoding='utf-8')
+            write_csv_text(output_path, content)
 
         elif args.format == "json":
             import json

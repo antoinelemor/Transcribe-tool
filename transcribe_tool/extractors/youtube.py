@@ -49,8 +49,8 @@ class YouTubeExtractor(BaseExtractor):
         if existing:
             self.logger.info(f"Already downloaded: {video_id}")
             # Still need to fetch metadata for cached files
-            ydl_opts = self._get_ydl_opts()
             try:
+                ydl_opts = self._get_ydl_opts()
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     return ExtractionResult(
@@ -76,15 +76,16 @@ class YouTubeExtractor(BaseExtractor):
                     video_id=video_id
                 )
 
-        # Setup yt-dlp options
-        ydl_opts = self._get_ydl_opts()
-
-        # Temporary output template
         output_dir = self.config.output_dir / subdir if subdir else self.config.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
-        ydl_opts['outtmpl'] = str(output_dir / f"%(upload_date)s_%(title)s_%(id)s.%(ext)s")
 
         try:
+            # Setup yt-dlp options
+            ydl_opts = self._get_ydl_opts()
+
+            # Temporary output template
+            ydl_opts['outtmpl'] = str(output_dir / f"%(upload_date)s_%(title).60s_%(id)s.%(ext)s")
+
             with YoutubeDL(ydl_opts) as ydl:
                 self.logger.info(f"Downloading audio: {url}")
 
@@ -99,8 +100,11 @@ class YouTubeExtractor(BaseExtractor):
                 # Download
                 ydl.download([url])
 
-                # Find the downloaded file
-                audio_files = list(output_dir.glob(f"*_{video_id}.*"))
+                # Find the downloaded file (the postprocessor only runs for wav/mp3)
+                if self.config.audio_format in ('wav', 'mp3'):
+                    audio_files = list(output_dir.glob(f"*_{video_id}.{self.config.audio_format}"))
+                else:
+                    audio_files = list(output_dir.glob(f"*_{video_id}.*"))
                 if audio_files:
                     audio_path = audio_files[0]
                     self.logger.info(f"Downloaded: {audio_path.name}")
@@ -119,6 +123,12 @@ class YouTubeExtractor(BaseExtractor):
                             'description': info.get('description', ''),
                             'url': url
                         }
+                    )
+                elif list(output_dir.glob(f"*_{video_id}.*")):
+                    return ExtractionResult(
+                        success=False,
+                        video_id=video_id,
+                        error="FFmpeg post-processing failed. Is FFmpeg installed and on PATH?"
                     )
                 else:
                     return ExtractionResult(success=False, error="Audio file not found after download")

@@ -307,29 +307,117 @@ class DocumentLoader:
         )
 
     # =========================================================================
+    # Encoding helpers
+    # =========================================================================
+
+    # Order is load-bearing: plain 'utf-8' decodes a BOM as U+FEFF instead of
+    # raising, and 'latin-1' never raises for any byte sequence, so each would
+    # mask the candidate it precedes here.
+    ENCODING_CANDIDATES = ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1']
+
+    # Labels a document may declare that browsers deliberately decode as
+    # cp1252 instead (WHATWG Encoding Standard). Honouring them literally maps
+    # bytes 0x80-0x9F to C1 control characters, so a declared-iso-8859-1 page
+    # turns "l'ete" into "l\x92ete". cp1252 is a superset of iso-8859-1 over
+    # every printable position, so this can only ever recover characters.
+    _LEGACY_LATIN1_LABELS = frozenset([
+        'iso-8859-1', 'iso8859-1', 'iso_8859-1', 'iso-8859-1-windows-3.1-latin-1',
+        'latin-1', 'latin1', 'l1', 'ascii', 'us-ascii', 'ansi_x3.4-1968',
+    ])
+
+    # A byte-order mark is definitive and outranks any charset a document
+    # declares about itself, so a declared encoding must be ignored when one
+    # is present (e.g. a UTF-8 file whose stale <meta> still says iso-8859-1).
+    # UTF-16 is not hypothetical on Windows: it is what Notepad's "Unicode"
+    # option and PowerShell 5.1's `>` / Out-File produce by default. Without
+    # this, 'latin-1' happily decodes such a file into interleaved NUL bytes
+    # and the corpus silently fills with garbage. Longest BOM first, since the
+    # UTF-32-LE mark begins with the UTF-16-LE one.
+    _BOM_ENCODINGS = (
+        (b'\x00\x00\xfe\xff', 'utf-32'),  # UTF-32 BE
+        (b'\xff\xfe\x00\x00', 'utf-32'),  # UTF-32 LE
+        (b'\xef\xbb\xbf', 'utf-8-sig'),   # UTF-8
+        (b'\xfe\xff', 'utf-16'),          # UTF-16 BE
+        (b'\xff\xfe', 'utf-16'),          # UTF-16 LE
+    )
+
+    @classmethod
+    def _bom_encoding(cls, raw: bytes) -> Optional[str]:
+        """Return the codec implied by a leading byte-order mark, if any.
+
+        The bare 'utf-16'/'utf-32' codec names are deliberate: they consume
+        the mark and infer endianness, where the explicit LE/BE variants
+        would leave a U+FEFF at the start of the text.
+        """
+        for bom, encoding in cls._BOM_ENCODINGS:
+            if raw.startswith(bom):
+                return encoding
+        return None
+
+    @classmethod
+    def _has_utf_bom(cls, raw: bytes) -> bool:
+        """True if the bytes open with any UTF byte-order mark."""
+        return cls._bom_encoding(raw) is not None
+
+    def _read_text_best_effort(
+        self,
+        path: Path,
+        preferred: Optional[str] = None
+    ) -> Tuple[str, str]:
+        """
+        Read a text file, trying encodings from strictest to most permissive.
+
+        Args:
+            path: Path to the file
+            preferred: Encoding to try first (e.g. one declared by the document)
+
+        Returns:
+            Tuple of (decoded content, encoding actually used)
+        """
+        raw = path.read_bytes()
+        encodings = list(self.ENCODING_CANDIDATES)
+
+        bom_encoding = self._bom_encoding(raw)
+        if bom_encoding:
+            # A mark beats anything the document claims about itself.
+            encodings = [bom_encoding] + [e for e in encodings
+                                          if e != bom_encoding]
+        elif preferred:
+            preferred = preferred.strip().lower()
+            if preferred in self._LEGACY_LATIN1_LABELS:
+                preferred = 'cp1252'
+            encodings = [preferred] + [e for e in encodings if e != preferred]
+
+        for encoding in encodings:
+            try:
+                content = raw.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            if encoding == 'utf-8-sig' and not raw.startswith(b'\xef\xbb\xbf'):
+                encoding = 'utf-8'
+            return content, encoding
+
+        return raw.decode('utf-8', errors='replace'), 'utf-8 (with errors replaced)'
+
+    def _sniff_html_charset(self, raw: bytes) -> Optional[str]:
+        """Find the charset declared in an HTML/XML header, if any."""
+        head = raw[:4096].decode('ascii', errors='ignore')
+
+        match = re.search(r'<meta[^>]+charset\s*=\s*["\']?\s*([\w.:+-]+)',
+                          head, re.IGNORECASE)
+        if not match:
+            match = re.search(r'<\?xml[^>]+encoding\s*=\s*["\']([\w.:+-]+)["\']',
+                              head, re.IGNORECASE)
+
+        return match.group(1) if match else None
+
+    # =========================================================================
     # Format-specific loaders
     # =========================================================================
 
     def _load_txt(self, path: Path) -> Document:
         """Load plain text file."""
-        # Try different encodings
-        encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
-
-        content = None
-        used_encoding = None
-
-        for encoding in encodings:
-            try:
-                content = path.read_text(encoding=encoding)
-                used_encoding = encoding
-                break
-            except UnicodeDecodeError:
-                continue
-
-        if content is None:
-            # Last resort: read as bytes and decode with errors ignored
-            content = path.read_bytes().decode('utf-8', errors='ignore')
-            used_encoding = 'utf-8 (with errors ignored)'
+        content, used_encoding = self._read_text_best_effort(path)
 
         return Document(
             content=self._clean_text(content),
@@ -516,7 +604,7 @@ class DocumentLoader:
 
     def _load_markdown(self, path: Path) -> Document:
         """Load Markdown file and optionally strip markup."""
-        content = path.read_text(encoding='utf-8')
+        content, used_encoding = self._read_text_best_effort(path)
 
         # Strip markdown formatting for cleaner text
         clean_content = self._strip_markdown(content)
@@ -526,7 +614,7 @@ class DocumentLoader:
             path=path,
             format=DocumentFormat.MD,
             title=path.stem,
-            metadata={'raw_markdown': content}
+            metadata={'raw_markdown': content, 'encoding': used_encoding}
         )
 
     def _load_rtf(self, path: Path) -> Document:
@@ -543,14 +631,15 @@ class DocumentLoader:
         try:
             from striprtf.striprtf import rtf_to_text
 
-            rtf_content = path.read_text(encoding='utf-8', errors='ignore')
+            rtf_content, used_encoding = self._read_text_best_effort(path)
             content = rtf_to_text(rtf_content)
 
             return Document(
                 content=self._clean_text(content),
                 path=path,
                 format=DocumentFormat.RTF,
-                title=path.stem
+                title=path.stem,
+                metadata={'encoding': used_encoding}
             )
         except Exception as e:
             return Document(
@@ -563,13 +652,27 @@ class DocumentLoader:
 
     def _load_html(self, path: Path) -> Document:
         """Load HTML file and extract text."""
-        content = path.read_text(encoding='utf-8', errors='ignore')
+        raw = path.read_bytes()
+        declared = self._sniff_html_charset(raw)
+
+        # BeautifulSoup honours a declared iso-8859-1/latin-1 literally, which
+        # maps bytes 0x80-0x9F to C1 control characters. Override those labels
+        # only, and only when the document actually declares one; everything
+        # else is left to BeautifulSoup's own detection.
+        from_encoding = None
+        if (declared and not self._has_utf_bom(raw)
+                and declared.strip().lower() in self._LEGACY_LATIN1_LABELS):
+            from_encoding = 'cp1252'
 
         if self.has_bs4:
             try:
                 from bs4 import BeautifulSoup
 
-                soup = BeautifulSoup(content, 'html.parser')
+                # Pass the raw bytes: BeautifulSoup honours the BOM, the
+                # <meta charset> and the XML declaration, which a string
+                # decoded beforehand would have already hidden.
+                soup = BeautifulSoup(raw, 'html.parser',
+                                     from_encoding=from_encoding)
 
                 # Remove script and style elements
                 for script in soup(['script', 'style', 'head', 'meta', 'link']):
@@ -585,19 +688,24 @@ class DocumentLoader:
                     content=self._clean_text(text),
                     path=path,
                     format=DocumentFormat.HTML,
-                    title=title
+                    title=title,
+                    metadata={'encoding': soup.original_encoding}
                 )
             except Exception as e:
                 self.logger.debug(f"BeautifulSoup failed: {e}")
 
         # Fallback: simple regex-based tag stripping
+        content, used_encoding = self._read_text_best_effort(
+            path, preferred=declared
+        )
         text = self._strip_html_tags(content)
 
         return Document(
             content=self._clean_text(text),
             path=path,
             format=DocumentFormat.HTML,
-            title=path.stem
+            title=path.stem,
+            metadata={'encoding': used_encoding}
         )
 
     def _load_epub(self, path: Path) -> Document:
@@ -628,7 +736,7 @@ class DocumentLoader:
             # Extract text from each item
             for item in book.get_items():
                 if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                    content = item.get_content().decode('utf-8', errors='ignore')
+                    content = item.get_content().decode('utf-8', errors='replace')
 
                     if self.has_bs4:
                         from bs4 import BeautifulSoup
@@ -781,6 +889,10 @@ class DocumentLoader:
         # Normalize unicode
         import unicodedata
         text = unicodedata.normalize('NFKC', text)
+
+        # Drop byte-order marks: NFKC keeps U+FEFF, and a leading one would
+        # survive .strip() glued to the first token
+        text = text.replace('\ufeff', '')
 
         # Replace various dash types with standard hyphen
         text = re.sub(r'[\u2010-\u2015\u2212]', '-', text)

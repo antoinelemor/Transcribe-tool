@@ -17,6 +17,8 @@ import torch
 import pandas as pd
 from tqdm import tqdm
 
+from ..utils.platform_compat import resolve_binary, run_tool
+
 try:
     from pyannote.audio import Pipeline
     from pyannote.core import Annotation, Segment
@@ -140,22 +142,66 @@ class SpeakerDiarizer:
 
     def _get_audio_duration(self, audio_path: Path) -> float:
         """Get audio duration in seconds."""
-        try:
-            import subprocess
-            result = subprocess.run(
-                [
-                    "ffprobe", "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(audio_path)
-                ],
-                capture_output=True,
-                text=True,
-                check=True
+        duration = self._probe_duration_ffprobe(audio_path)
+
+        if duration is None:
+            duration = self._probe_duration_ffmpeg(audio_path)
+
+        # A zero duration is as unusable as no duration at all: the caller
+        # divides by it to size the progress bar.
+        if duration is None or duration <= 0:
+            self.logger.warning(
+                f"Could not determine duration of {audio_path.name} "
+                "(is FFmpeg installed and on PATH?); progress estimates will be wrong"
             )
+            return 60.0  # Default estimate
+
+        return duration
+
+    def _probe_duration_ffprobe(self, audio_path: Path) -> Optional[float]:
+        """Read duration with ffprobe, or None if it cannot be determined."""
+        ffprobe = resolve_binary("ffprobe")
+        if ffprobe is None:
+            return None
+
+        try:
+            result = run_tool([
+                ffprobe, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio_path)
+            ])
+            if result.returncode != 0:
+                return None
             return float(result.stdout.strip())
         except Exception:
-            return 60.0  # Default estimate
+            return None
+
+    def _probe_duration_ffmpeg(self, audio_path: Path) -> Optional[float]:
+        """Parse duration out of ffmpeg's stderr header, or None on failure.
+
+        Several FFmpeg distributions - notably the common Windows builds - ship
+        without ffprobe, so this is the only probe available on those machines.
+        """
+        ffmpeg = resolve_binary("ffmpeg")
+        if ffmpeg is None:
+            return None
+
+        try:
+            import re
+            # ffmpeg always exits non-zero when no output file is given, so the
+            # return code says nothing about whether the header was read.
+            result = run_tool([ffmpeg, "-hide_banner", "-i", str(audio_path)])
+            match = re.search(
+                r'Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)',
+                result.stderr or ""
+            )
+            if match is None:
+                return None
+            hours, minutes, seconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except Exception:
+            return None
 
     def _load_audio_for_pyannote(self, audio_path: Path) -> dict:
         """Load audio in a format compatible with pyannote (avoids torchcodec issues)."""

@@ -28,6 +28,7 @@ try:
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
     from rich.text import Text
     from rich.tree import Tree
+    from rich.markup import escape
     from rich import box
     HAS_RICH = True
 except ImportError:
@@ -36,6 +37,13 @@ except ImportError:
     sys.exit(1)
 
 # Internal imports
+# platform_compat comes first: importing it disables the Windows
+# CWD-before-PATH executable lookup, and that must happen before any module
+# below can spawn a subprocess.
+from ..utils.platform_compat import (
+    configure_stdio, resolve_binary, run_tool,
+    write_csv_text, safe_output_path, restrict_permissions
+)
 from ..config.settings import Config, get_config, set_config
 from ..extractors import YouTubeExtractor, TikTokExtractor, LocalExtractor
 from ..extractors.base import ExtractorConfig
@@ -51,6 +59,10 @@ from ..utils.text_tokenization import (
     tokenize_dataframe, format_tokenization_rds,
     get_available_nlp_features, get_supported_languages as get_nlp_languages
 )
+
+# Called at module scope, not from run(): transcribe_tool.cli.run_cli can be
+# imported directly, bypassing __main__.main().
+configure_stdio()
 
 
 # Banner - Simple text version that always displays correctly
@@ -81,10 +93,41 @@ class TranscribeCLI:
 
         return logger
 
+    def _ask_path(self, prompt: str, **kwargs) -> str:
+        """Ask for a file or directory path and normalise what the user pasted.
+
+        Windows Explorer's "Copy as path" always wraps the path in double
+        quotes, and Rich only strips whitespace, so the quoted string would
+        never resolve. Single quotes are left alone - they are a legal file
+        name character on every platform.
+
+        Args:
+            prompt: Prompt text passed to Rich
+            **kwargs: Forwarded to Prompt.ask (e.g. default=...)
+
+        Returns:
+            The expanded path, or an empty string if nothing was entered
+        """
+        raw = Prompt.ask(prompt, **kwargs)
+        if not raw:
+            return ""
+
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            raw = raw[1:-1]
+
+        # expandvars first: %USERPROFILE% can itself expand to a ~-prefixed value.
+        return os.path.expanduser(os.path.expandvars(raw))
+
     def run(self):
         """Run the main CLI loop."""
-        self._show_banner()
-        self._show_system_info()
+        try:
+            self._show_banner()
+            self._show_system_info()
+        except Exception as e:
+            self.console.print(
+                f"[yellow]Could not display startup info:[/yellow] {escape(str(e))}"
+            )
 
         while True:
             try:
@@ -148,8 +191,6 @@ class TranscribeCLI:
         """Display system information."""
         import torch
         import platform
-        import subprocess
-        import shutil
 
         # Get friendly OS name
         system = platform.system()
@@ -183,9 +224,10 @@ class TranscribeCLI:
 
         # Get FFmpeg version
         ffmpeg_version = "Not found"
-        if shutil.which("ffmpeg"):
+        ffmpeg_exe = resolve_binary("ffmpeg")
+        if ffmpeg_exe:
             try:
-                result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+                result = run_tool([ffmpeg_exe, "-version"], timeout=5)
                 if result.returncode == 0:
                     first_line = result.stdout.split('\n')[0]
                     # Extract version number
@@ -403,9 +445,9 @@ class TranscribeCLI:
         extractor = LocalExtractor(config=extractor_config, logger=self.logger)
 
         if choice == "1":
-            file_path = Prompt.ask("Enter file path")
+            file_path = self._ask_path("Enter file path")
             if not file_path or not Path(file_path).exists():
-                self.console.print("[red]File not found[/red]")
+                self.console.print(f"[red]File not found:[/red] {escape(file_path)}")
                 return
 
             result = extractor.extract_audio(file_path)
@@ -418,9 +460,9 @@ class TranscribeCLI:
                 self.console.print(f"[red]Failed: {result.error}[/red]")
 
         elif choice == "2":
-            directory = Prompt.ask("Enter directory path")
+            directory = self._ask_path("Enter directory path")
             if not directory or not Path(directory).exists():
-                self.console.print("[red]Directory not found[/red]")
+                self.console.print(f"[red]Directory not found:[/red] {escape(directory)}")
                 return
 
             files = extractor.scan_directory(directory)
@@ -470,17 +512,17 @@ class TranscribeCLI:
             return
 
         if choice == "1":
-            file_path = Prompt.ask("Enter audio file path")
+            file_path = self._ask_path("Enter audio file path")
             if not file_path or not Path(file_path).exists():
-                self.console.print("[red]File not found[/red]")
+                self.console.print(f"[red]File not found:[/red] {escape(file_path)}")
                 return
 
             self._transcribe_file(Path(file_path))
 
         elif choice == "2":
-            directory = Prompt.ask("Enter directory path", default=str(self.config.audio_dir))
+            directory = self._ask_path("Enter directory path", default=str(self.config.audio_dir))
             if not directory or not Path(directory).exists():
-                self.console.print("[red]Directory not found[/red]")
+                self.console.print(f"[red]Directory not found:[/red] {escape(directory)}")
                 return
 
             # Find audio files
@@ -661,7 +703,9 @@ class TranscribeCLI:
             metadata = self._extract_metadata_from_filename(audio_path)
 
         # Save output
-        output_path = self.config.transcripts_dir / f"{audio_path.stem}.{output_format}"
+        output_path = safe_output_path(
+            self.config.transcripts_dir, audio_path.stem, f".{output_format}"
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if output_format == "txt":
@@ -680,7 +724,7 @@ class TranscribeCLI:
                 segmentation_level=segmentation,
                 language=result.language
             )
-            output_path.write_text(content, encoding='utf-8')
+            write_csv_text(output_path, content)
 
         elif output_format == "json":
             import json
@@ -713,7 +757,10 @@ class TranscribeCLI:
     def _get_config_file_path(self) -> Path:
         """Get path to config file for fallback token storage."""
         config_dir = Path.home() / ".transcribe-tool"
+        existed = config_dir.exists()
         config_dir.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            restrict_permissions(config_dir)
         return config_dir / "config.json"
 
     def _get_token_from_file(self) -> Optional[str]:
@@ -722,7 +769,7 @@ class TranscribeCLI:
             config_path = self._get_config_file_path()
             if config_path.exists():
                 import json
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 return config.get('hf_token')
         except Exception:
@@ -739,18 +786,18 @@ class TranscribeCLI:
             config = {}
             if config_path.exists():
                 try:
-                    with open(config_path, 'r') as f:
+                    with open(config_path, 'r', encoding='utf-8') as f:
                         config = json.load(f)
                 except Exception:
                     pass
 
             config['hf_token'] = token
 
-            with open(config_path, 'w') as f:
+            with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2)
 
-            # Set restrictive permissions (owner read/write only)
-            config_path.chmod(0o600)
+            # Drop inherited ACLs on Windows, chmod 0600 elsewhere - best effort
+            restrict_permissions(config_path)
             return True
         except Exception as e:
             self.logger.warning(f"Could not save token to file: {e}")
@@ -762,11 +809,11 @@ class TranscribeCLI:
             config_path = self._get_config_file_path()
             if config_path.exists():
                 import json
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 if 'hf_token' in config:
                     del config['hf_token']
-                    with open(config_path, 'w') as f:
+                    with open(config_path, 'w', encoding='utf-8') as f:
                         json.dump(config, f, indent=2)
             return True
         except Exception:
@@ -802,10 +849,13 @@ class TranscribeCLI:
         except Exception as e:
             self.logger.debug(f"keyring save error: {e}, using config file")
 
-        # Always also save to file as backup
-        saved_to_file = self._save_token_to_file(token)
+        # Only fall back to the plaintext file when the keychain refused it,
+        # and clear any earlier copy so the getter cannot resurrect it
+        if saved_to_keyring:
+            self._delete_token_from_file()
+            return True
 
-        return saved_to_keyring or saved_to_file
+        return self._save_token_to_file(token)
 
     def _delete_hf_token_from_keyring(self) -> bool:
         """Delete HuggingFace token from system keychain and config file."""
@@ -927,7 +977,7 @@ class TranscribeCLI:
         if checkpoint_path.exists():
             try:
                 import json
-                with open(checkpoint_path, 'r') as f:
+                with open(checkpoint_path, 'r', encoding='utf-8') as f:
                     checkpoint = json.load(f)
                 return checkpoint
             except Exception as e:
@@ -954,7 +1004,7 @@ class TranscribeCLI:
                 'failed': failed,
                 'settings': settings
             }
-            with open(checkpoint_path, 'w') as f:
+            with open(checkpoint_path, 'w', encoding='utf-8') as f:
                 json.dump(checkpoint, f, indent=2)
         except Exception as e:
             self.logger.warning(f"Failed to save checkpoint: {e}")
@@ -1175,9 +1225,9 @@ class TranscribeCLI:
 
         elif source_choice == "3":
             # Local directory
-            directory = Prompt.ask("Enter directory path", default=str(self.config.audio_dir))
+            directory = self._ask_path("Enter directory path", default=str(self.config.audio_dir))
             if not directory or not Path(directory).exists():
-                self.console.print("[red]Directory not found[/red]")
+                self.console.print(f"[red]Directory not found:[/red] {escape(directory)}")
                 return
 
             audio_extensions = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
@@ -1327,15 +1377,17 @@ class TranscribeCLI:
             # Update pipeline progress bar description
             pipeline_pbar.set_postfix_str(f"{audio_path.name[:30]}...")
 
-            print(f"\n{'━' * 50}")
-            print(f"File {file_num}/{total_files}: {audio_path.name}")
-            print(f"{'━' * 50}")
-
             metadata = metadata_list[i] if i < len(metadata_list) and metadata_list[i] else None
             if metadata is None:
                 metadata = self._extract_metadata_from_filename(audio_path)
 
             try:
+                # Printed inside the try so a console encoding failure costs a
+                # single file rather than aborting the whole batch
+                print(f"\n{'━' * 50}")
+                print(f"File {file_num}/{total_files}: {audio_path.name}")
+                print(f"{'━' * 50}")
+
                 result = self._do_transcription(
                     audio_path=audio_path,
                     language=language,
@@ -1544,9 +1596,9 @@ class TranscribeCLI:
 
         if source_choice == "1":
             # Single file
-            file_path = Prompt.ask("Enter file path")
+            file_path = self._ask_path("Enter file path")
             if not file_path or not Path(file_path).exists():
-                self.console.print("[red]File not found[/red]")
+                self.console.print(f"[red]File not found:[/red] {escape(file_path)}")
                 return
 
             self.console.print(f"[dim]Supported: {', '.join(loader.get_supported_formats())}[/dim]")
@@ -1567,9 +1619,9 @@ class TranscribeCLI:
 
         elif source_choice == "2":
             # Directory
-            directory = Prompt.ask("Enter directory path")
+            directory = self._ask_path("Enter directory path")
             if not directory or not Path(directory).exists():
-                self.console.print("[red]Directory not found[/red]")
+                self.console.print(f"[red]Directory not found:[/red] {escape(directory)}")
                 return
 
             self.console.print("\n[bold]File Types:[/bold]")
@@ -1815,8 +1867,13 @@ class TranscribeCLI:
             base_name = f"tokenized_{len(documents)}_docs"
 
         seg_str = f"seg{segmentation_level}" if segmentation_level > 0 else "para"
-        output_path = output_dir / f"{base_name}_{language}_{seg_str}_{timestamp}.{ext}"
-        output_path.write_text(output_content, encoding='utf-8')
+        output_path = safe_output_path(
+            output_dir, f"{base_name}_{language}_{seg_str}_{timestamp}", f".{ext}"
+        )
+        if ext == "csv":
+            write_csv_text(output_path, output_content)
+        else:
+            output_path.write_text(output_content, encoding='utf-8')
 
         self.console.print(f"\n[green]Output saved to:[/green] {output_path}")
 
@@ -2085,15 +2142,17 @@ class TranscribeCLI:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = doc.path.stem
 
+        export_stem = f"{base_name}_tokenized_{timestamp}"
+
         if output_format == "rds":
-            output_path = output_dir / f"{base_name}_tokenized_{timestamp}.rds"
+            output_path = safe_output_path(output_dir, export_stem, ".rds")
             self.console.print(f"\n[dim]Writing RDS file...[/dim]")
             format_tokenization_rds(result_df, str(output_path))
         elif output_format == "csv":
-            output_path = output_dir / f"{base_name}_tokenized_{timestamp}.csv"
+            output_path = safe_output_path(output_dir, export_stem, ".csv")
             result_df.to_csv(str(output_path), index=False, encoding='utf-8')
         elif output_format == "json":
-            output_path = output_dir / f"{base_name}_tokenized_{timestamp}.json"
+            output_path = safe_output_path(output_dir, export_stem, ".json")
             result_df.to_json(str(output_path), orient='records', force_ascii=False, indent=2)
 
         self.console.print(f"[green]Output saved to:[/green] {output_path}")

@@ -286,7 +286,7 @@ def _detect_optimal_config(use_gpu: bool = True, logger: Optional[logging.Logger
         import torch
         if torch.cuda.is_available():
             config.device = "cuda"
-            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             if vram_gb > 8:
                 config.spacy_batch_size = 512
                 config.wtp_batch_size = 256
@@ -313,13 +313,14 @@ def _detect_optimal_config(use_gpu: bool = True, logger: Optional[logging.Logger
             config.pipeline_prefetch = 0
             log.info(f"Processing config: CPU (spacy_batch={config.spacy_batch_size}, "
                      f"wtp_batch={config.wtp_batch_size}, threads={config.json_threads})")
-    except ImportError:
+    except Exception as e:
         config.device = "cpu"
         config.spacy_batch_size = 128
         config.wtp_batch_size = 64
         config.json_threads = min(os.cpu_count() or 4, 4)
         config.pipeline_prefetch = 0
-        log.info(f"Processing config: CPU fallback (no torch)")
+        log.debug(f"GPU detection failed: {e}")
+        log.info("Processing config: CPU fallback (GPU unavailable)")
 
     return config
 
@@ -1721,8 +1722,17 @@ def format_tokenization_rds(df, output_path: str):
     Args:
         df: pandas DataFrame with tk_* columns
         output_path: Path to write the .rds file
+
+    Raises:
+        ImportError: If pyreadr is not installed
     """
-    import pyreadr
+    try:
+        import pyreadr
+    except ImportError:
+        raise ImportError(
+            "pyreadr is required to write .rds files. "
+            'Install it with: pip install -e ".[rdata]"'
+        ) from None
     pyreadr.write_rds(str(output_path), df)
 
 

@@ -16,6 +16,8 @@ from typing import Optional, List, Callable
 from dataclasses import dataclass
 from tqdm import tqdm
 
+from .platform_compat import resolve_binary, run_tool, child_utf8_env
+
 
 def _detect_audio_device() -> str:
     """Detect the best device for audio processing (Demucs)."""
@@ -67,8 +69,8 @@ class AudioProcessor:
         self.config = config or AudioProcessingConfig()
         self.logger = logger or logging.getLogger(__name__)
 
-        # Characters problematic for shell commands
-        self.shell_problematic_chars = [
+        # Characters that are invalid or problematic inside a filename
+        self.unsafe_filename_chars = [
             ' ', "'", '"', '(', ')', '&', ';', '|',
             '$', '`', '\\', '!', '#', '*', '?',
             '[', ']', '{', '}', '<', '>',
@@ -99,9 +101,16 @@ class AudioProcessor:
         if output_path is None:
             output_path = video_path.with_suffix(f".{format}")
 
+        ffmpeg = resolve_binary("ffmpeg")
+        if ffmpeg is None:
+            self.logger.error("FFmpeg not found. Install it and make sure it is on PATH")
+            return None
+
         try:
             cmd = [
-                "ffmpeg", "-i", str(video_path),
+                ffmpeg,
+                "-hide_banner", "-loglevel", "error",
+                "-i", str(video_path),
                 "-vn",  # No video
                 "-acodec", "pcm_s16le" if format == "wav" else "libmp3lame",
                 "-ar", "16000",  # 16kHz sample rate (good for speech)
@@ -110,12 +119,7 @@ class AudioProcessor:
                 str(output_path)
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False
-            )
+            result = run_tool(cmd)
 
             if result.returncode != 0:
                 self.logger.error(f"FFmpeg failed: {result.stderr}")
@@ -155,19 +159,20 @@ class AudioProcessor:
             demucs_output = output_dir / "demucs_temp"
             demucs_output.mkdir(parents=True, exist_ok=True)
 
-            # Handle problematic filenames
-            if any(c in str(audio_path) for c in self.shell_problematic_chars):
-                temp_audio = output_dir / f"{safe_stem}.wav"
-                shutil.copy2(audio_path, temp_audio)
-                audio_for_demucs = temp_audio
-                using_temp = True
-            else:
-                audio_for_demucs = audio_path
-                using_temp = False
+            # Demucs names its output directory after the input stem, so feed it
+            # a sanitized copy when the original stem would not survive
+            audio_for_demucs = audio_path
+            using_temp = False
+            if safe_stem != audio_path.stem:
+                temp_audio = output_dir / f"{safe_stem}{audio_path.suffix}"
+                if not (temp_audio.exists() and temp_audio.samefile(audio_path)):
+                    shutil.copy2(audio_path, temp_audio)
+                    audio_for_demucs = temp_audio
+                    using_temp = True
 
             # Run Demucs
             cmd = [
-                "demucs",
+                resolve_binary("demucs") or "demucs",
                 "--two-stems=vocals",
                 "-n", "htdemucs",
                 "--out", str(demucs_output),
@@ -180,6 +185,10 @@ class AudioProcessor:
 
             # Get audio duration for progress estimation
             audio_duration = self.get_audio_duration(audio_path) or 60.0
+
+            # Demucs is a child CPython and would otherwise encode its piped
+            # output with the locale code page
+            demucs_env = child_utf8_env()
 
             if self.config.show_progress:
                 # Run demucs with progress bar (estimate based on audio duration)
@@ -198,25 +207,37 @@ class AudioProcessor:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=demucs_env,
+                    # Matches run_tool(): without it the progress-bar path
+                    # flashes a console window on Windows while the non-progress
+                    # and CPU-fallback paths do not.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 )
 
                 start_time = time.time()
-                while process.poll() is None:
-                    elapsed = time.time() - start_time
-                    progress = min(95, (elapsed / estimated_time) * 100)
-                    pbar.n = progress
-                    pbar.refresh()
-                    time.sleep(0.5)
+                while True:
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        # communicate() keeps draining both pipes across
+                        # timeouts; polling alone deadlocks as soon as Demucs'
+                        # progress bar fills the OS pipe buffer
+                        elapsed = time.time() - start_time
+                        progress = min(95, (elapsed / estimated_time) * 100)
+                        pbar.n = progress
+                        pbar.refresh()
 
                 pbar.n = 100
                 pbar.refresh()
                 pbar.close()
 
-                stdout, stderr = process.communicate()
                 returncode = process.returncode
             else:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                result = run_tool(cmd, env=demucs_env)
                 returncode = result.returncode
                 stderr = result.stderr
 
@@ -225,9 +246,12 @@ class AudioProcessor:
                 # Try CPU fallback
                 if self.config.device != "cpu":
                     self.logger.info("Retrying with CPU...")
-                    cmd[-3] = "cpu"
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                    if result.returncode != 0:
+                    cmd[cmd.index("--device") + 1] = "cpu"
+                    result = run_tool(cmd, env=demucs_env)
+                    returncode = result.returncode
+                    stderr = result.stderr
+                    if returncode != 0:
+                        self.logger.error(f"Demucs failed on CPU: {stderr}")
                         return None
                 else:
                     return None
@@ -419,7 +443,7 @@ class AudioProcessor:
 
     def _sanitize_filename(self, filename: str) -> str:
         """Remove problematic characters from filename."""
-        for char in self.shell_problematic_chars:
+        for char in self.unsafe_filename_chars:
             filename = filename.replace(char, '_')
         # Remove multiple underscores
         filename = re.sub(r'_+', '_', filename)
@@ -434,15 +458,13 @@ class AudioProcessor:
         except Exception:
             # Fallback to ffprobe
             try:
-                result = subprocess.run(
+                result = run_tool(
                     [
-                        "ffprobe", "-v", "error",
+                        resolve_binary("ffprobe") or "ffprobe", "-v", "error",
                         "-show_entries", "format=duration",
                         "-of", "default=noprint_wrappers=1:nokey=1",
                         str(audio_path)
                     ],
-                    capture_output=True,
-                    text=True,
                     check=True
                 )
                 return float(result.stdout.strip())

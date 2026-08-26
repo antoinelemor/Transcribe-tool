@@ -5,10 +5,14 @@
 # This script automates the installation process for Transcribe Tool.
 # It creates a virtual environment, installs dependencies, and verifies the installation.
 #
+# On native Windows (PowerShell / cmd.exe) use install.ps1 or install.bat instead.
+#
 # Usage:
 #   ./install.sh              # Install core features
 #   ./install.sh --all        # Install all features (recommended)
 #   ./install.sh --full       # Alias for --all
+#   ./install.sh --dev        # Install development tools
+#   ./install.sh --yes        # Answer "yes" to every prompt (alias: -y)
 #
 # Author: Antoine Lemor
 
@@ -43,11 +47,29 @@ echo ""
 
 # Parse arguments
 INSTALL_TYPE="core"
-if [ "$1" == "--all" ] || [ "$1" == "--full" ]; then
-    INSTALL_TYPE="full"
+ASSUME_YES=false
+for arg in "$@"; do
+    case "$arg" in
+        --all|--full) INSTALL_TYPE="full" ;;
+        --dev)        INSTALL_TYPE="dev" ;;
+        --yes|-y)     ASSUME_YES=true ;;
+    esac
+done
+
+# Ask a yes/no question; --yes answers every prompt with "y"
+confirm() {
+    if [ "$ASSUME_YES" = true ]; then
+        echo "$1 y"
+        return 0
+    fi
+    read -p "$1 " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]]
+}
+
+if [ "$INSTALL_TYPE" == "full" ]; then
     echo -e "${BLUE}Installing with ALL features (diarization, voice separation)...${NC}"
-elif [ "$1" == "--dev" ]; then
-    INSTALL_TYPE="dev"
+elif [ "$INSTALL_TYPE" == "dev" ]; then
     echo -e "${BLUE}Installing with DEVELOPMENT tools...${NC}"
 else
     echo -e "${BLUE}Installing with CORE features...${NC}"
@@ -62,7 +84,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 if ! command -v python3 &> /dev/null; then
     echo -e "${RED}✗ Python 3 not found${NC}"
-    echo "  Please install Python 3.9 or higher from https://www.python.org/"
+    echo "  Please install Python 3.10 or higher from https://www.python.org/"
     exit 1
 fi
 
@@ -70,9 +92,9 @@ PYTHON_VERSION=$(python3 --version | cut -d' ' -f2)
 PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d'.' -f1)
 PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d'.' -f2)
 
-if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 9 ]); then
+if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 10 ]); then
     echo -e "${RED}✗ Python $PYTHON_VERSION is too old${NC}"
-    echo "  Required: Python 3.9 or higher"
+    echo "  Required: Python 3.10 or higher"
     echo "  Found: Python $PYTHON_VERSION"
     exit 1
 fi
@@ -92,11 +114,10 @@ if ! command -v ffmpeg &> /dev/null; then
     echo "  Install FFmpeg:"
     echo "    macOS:   brew install ffmpeg"
     echo "    Ubuntu:  sudo apt install ffmpeg"
-    echo "    Windows: Download from https://ffmpeg.org/download.html"
+    echo "    Windows: run install.ps1 instead (this script requires bash),"
+    echo "             or: winget install --id Gyan.FFmpeg -e"
     echo ""
-    read -p "  Continue anyway? [y/N] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if ! confirm "  Continue anyway? [y/N]"; then
         exit 1
     fi
 else
@@ -112,9 +133,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 if [ -d ".venv" ]; then
     echo -e "${YELLOW}⚠ Virtual environment already exists at .venv/${NC}"
-    read -p "  Remove and recreate? [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if confirm "  Remove and recreate? [y/N]"; then
         rm -rf .venv
         echo -e "${GREEN}✓ Removed existing virtual environment${NC}"
     else
@@ -206,7 +225,7 @@ elif [ "$INSTALL_TYPE" == "dev" ]; then
     # Python >=3.13 skips .pth files starting with __ (treats them as hidden),
     # which breaks setuptools editable installs. Fix by renaming the files.
     if [ "$PYTHON_MINOR" -ge 13 ]; then
-        SITE_PACKAGES="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+        SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
         PTH_FILE="$SITE_PACKAGES/__editable__.transcribe_tool-1.0.0.pth"
         FINDER_FILE="$SITE_PACKAGES/__editable___transcribe_tool_1_0_0_finder.py"
         if [ -f "$PTH_FILE" ]; then
@@ -214,8 +233,10 @@ elif [ "$INSTALL_TYPE" == "dev" ]; then
             NEW_FINDER="$SITE_PACKAGES/editable_transcribe_tool_1_0_0_finder.py"
             mv "$PTH_FILE" "$NEW_PTH"
             mv "$FINDER_FILE" "$NEW_FINDER"
-            sed -i '' 's/__editable___transcribe_tool_1_0_0_finder/editable_transcribe_tool_1_0_0_finder/g' "$NEW_PTH"
-            sed -i '' 's/__editable__.transcribe_tool-1.0.0.finder/editable.transcribe_tool-1.0.0.finder/g' "$NEW_FINDER"
+            # -i.bak is the only in-place form accepted by both BSD and GNU sed
+            sed -i.bak 's/__editable___transcribe_tool_1_0_0_finder/editable_transcribe_tool_1_0_0_finder/g' "$NEW_PTH"
+            sed -i.bak 's/__editable__.transcribe_tool-1.0.0.finder/editable.transcribe_tool-1.0.0.finder/g' "$NEW_FINDER"
+            rm -f "$NEW_PTH.bak" "$NEW_FINDER.bak"
             echo -e "  ${GREEN}✓ Applied Python 3.13+ editable install fix${NC}"
         fi
     fi
@@ -277,7 +298,9 @@ echo ""
 echo "Optional setup for speaker diarization:"
 echo ""
 echo "  Set your HuggingFace token (required for diarization):"
-echo -e "  ${YELLOW}export HF_TOKEN=\"your_huggingface_token\"${NC}"
+echo -e "  ${YELLOW}export HF_TOKEN=\"your_huggingface_token\"${NC}       ${CYAN}# macOS / Linux${NC}"
+echo -e "  ${YELLOW}\$env:HF_TOKEN = \"your_huggingface_token\"${NC}       ${CYAN}# Windows PowerShell (session)${NC}"
+echo -e "  ${YELLOW}setx HF_TOKEN \"your_huggingface_token\"${NC}         ${CYAN}# Windows (persistent, new terminal required)${NC}"
 echo ""
 echo "  Accept model terms at:"
 echo -e "  ${CYAN}https://huggingface.co/pyannote/speaker-diarization-3.1${NC}"

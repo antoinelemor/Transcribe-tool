@@ -5,13 +5,14 @@ Handles extraction and conversion of local audio/video files
 for transcription.
 """
 
+import re
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 from .base import BaseExtractor, ExtractionResult, ExtractorConfig
+from ..utils.platform_compat import resolve_binary, run_tool
 
 
 class LocalExtractor(BaseExtractor):
@@ -181,10 +182,16 @@ class LocalExtractor(BaseExtractor):
     def _extract_from_video(self, video_path: Path, output_path: Path) -> bool:
         """Extract audio track from video using ffmpeg."""
         try:
+            ffmpeg = resolve_binary('ffmpeg')
+            if not ffmpeg:
+                self.logger.error("FFmpeg not found. Please install FFmpeg.")
+                return False
+
             codec = 'pcm_s16le' if self.config.audio_format == 'wav' else 'libmp3lame'
 
             cmd = [
-                'ffmpeg', '-i', str(video_path),
+                ffmpeg, '-hide_banner', '-loglevel', 'error',
+                '-i', str(video_path),
                 '-vn',  # No video
                 '-acodec', codec,
                 '-ar', '16000',  # 16kHz sample rate
@@ -193,12 +200,7 @@ class LocalExtractor(BaseExtractor):
                 str(output_path)
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False
-            )
+            result = run_tool(cmd)
 
             if result.returncode == 0:
                 self.logger.info(f"Extracted audio to: {output_path.name}")
@@ -217,10 +219,16 @@ class LocalExtractor(BaseExtractor):
     def _convert_audio(self, input_path: Path, output_path: Path) -> bool:
         """Convert audio to target format using ffmpeg."""
         try:
+            ffmpeg = resolve_binary('ffmpeg')
+            if not ffmpeg:
+                self.logger.warning("FFmpeg not found, using source file as-is")
+                return False
+
             codec = 'pcm_s16le' if self.config.audio_format == 'wav' else 'libmp3lame'
 
             cmd = [
-                'ffmpeg', '-i', str(input_path),
+                ffmpeg, '-hide_banner', '-loglevel', 'error',
+                '-i', str(input_path),
                 '-acodec', codec,
                 '-ar', '16000',
                 '-ac', '1',
@@ -228,12 +236,7 @@ class LocalExtractor(BaseExtractor):
                 str(output_path)
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False
-            )
+            result = run_tool(cmd)
 
             if result.returncode == 0:
                 self.logger.info(f"Converted audio to: {output_path.name}")
@@ -264,21 +267,42 @@ class LocalExtractor(BaseExtractor):
             'is_audio': file_path.suffix.lower() in self.SUPPORTED_AUDIO,
         }
 
-        # Try to get duration with ffprobe
-        try:
-            result = subprocess.run(
-                [
-                    'ffprobe', '-v', 'error',
+        info['duration'] = self._probe_duration(file_path)
+
+        return info
+
+    def _probe_duration(self, file_path: Path) -> Optional[float]:
+        """Get media duration in seconds, via ffprobe or ffmpeg's stderr."""
+        ffprobe = resolve_binary('ffprobe')
+        if ffprobe:
+            try:
+                result = run_tool([
+                    ffprobe, '-v', 'error',
                     '-show_entries', 'format=duration',
                     '-of', 'default=noprint_wrappers=1:nokey=1',
                     str(file_path)
-                ],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            info['duration'] = float(result.stdout.strip())
-        except Exception:
-            info['duration'] = None
+                ])
+                return float(result.stdout.strip())
+            except Exception:
+                pass
 
-        return info
+        # Several Windows FFmpeg distributions ship without ffprobe; ffmpeg
+        # itself prints "Duration: HH:MM:SS.ss" to stderr when asked to open a
+        # file with no output specified (and then exits non-zero).
+        ffmpeg = resolve_binary('ffmpeg')
+        if not ffmpeg:
+            return None
+
+        try:
+            result = run_tool([ffmpeg, '-hide_banner', '-i', str(file_path)])
+            match = re.search(
+                r'Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)',
+                result.stderr or ''
+            )
+            if match:
+                hours, minutes, seconds = match.groups()
+                return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except Exception:
+            pass
+
+        return None

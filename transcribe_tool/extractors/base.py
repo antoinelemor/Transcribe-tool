@@ -13,6 +13,8 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from ..utils.platform_compat import resolve_binary
+
 
 @dataclass
 class ExtractionResult:
@@ -99,10 +101,15 @@ class BaseExtractor(ABC):
         return random.uniform(self.config.min_delay, self.config.max_delay)
 
     def _get_ydl_opts(self) -> Dict[str, Any]:
-        """Get common yt-dlp options."""
+        """
+        Get common yt-dlp options.
+
+        Raises:
+            RuntimeError: If the configured audio format needs FFmpeg post-processing
+                and FFmpeg cannot be found
+        """
         opts = {
             'format': 'bestaudio/best',
-            'ignoreerrors': True,
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': 30,
@@ -113,6 +120,20 @@ class BaseExtractor(ABC):
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
             }
         }
+
+        # FFmpeg: without it yt-dlp silently keeps the un-converted download
+        # (.webm/.m4a) and the failure only surfaces much later, inside Whisper
+        ffmpeg_exe = resolve_binary('ffmpeg')
+        if ffmpeg_exe:
+            opts['ffmpeg_location'] = str(Path(ffmpeg_exe).parent)
+        elif self.config.audio_format in ('wav', 'mp3'):
+            raise RuntimeError(
+                "FFmpeg is required to convert downloaded audio to "
+                f"{self.config.audio_format} but was not found on PATH. "
+                "Windows: run 'winget install --id Gyan.FFmpeg -e', then close "
+                "and reopen the terminal so PATH is refreshed. "
+                "macOS: 'brew install ffmpeg'. Linux: 'sudo apt install ffmpeg'."
+            )
 
         # Audio format
         if self.config.audio_format == 'wav':

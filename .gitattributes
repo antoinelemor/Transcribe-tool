@@ -1,0 +1,35 @@
+# Normalise line endings so a clone with core.autocrlf=true (the Windows default)
+# cannot break install.sh under bash or install.bat under cmd.exe.
+
+* text=auto
+
+*.sh    text eol=lf
+*.ps1   text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.txt   text eol=lf
+
+# cmd.exe's line-oriented parser mishandles LF-only scripts around labels and goto.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# CSV is the R-facing output format: keep it byte-exact so `* text=auto` never
+# rewrites its row terminators on a Windows checkout.
+*.csv   -text
+*.tsv   -text
+
+*.wav   binary
+*.mp3   binary
+*.m4a   binary
+*.aac   binary
+*.flac  binary
+*.ogg   binary
+*.opus  binary
+*.wma   binary
+*.mp4   binary
+*.webm  binary
+*.rds   binary
+*.pt    binary
+*.bin   binary
+*.onnx  binary

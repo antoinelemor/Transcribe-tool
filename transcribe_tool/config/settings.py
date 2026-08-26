@@ -8,14 +8,20 @@ transcription, and processing.
 import os
 import platform
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
 import torch
 
 
+@lru_cache(maxsize=1)
 def detect_device() -> tuple[str, bool]:
-    """Detect the best available device for processing."""
+    """Detect the best available device for processing.
+
+    Cached because the probe allocates and frees a test tensor on every call
+    and the available hardware cannot change within a process.
+    """
     system = platform.system()
 
     # Check CUDA
@@ -52,6 +58,9 @@ class Config:
     audio_format: str = "wav"
     audio_quality: str = "192"  # kbps for mp3, or 'best' for wav
 
+    # External tools
+    ffmpeg_path: Optional[Path] = None  # Explicit ffmpeg binary, for when it is not on PATH
+
     # Whisper settings
     whisper_model: str = "large-v3"
     whisper_language: Optional[str] = None  # Auto-detect if None
@@ -76,7 +85,7 @@ class Config:
     sentences_per_segment: int = 1
 
     # Processing settings
-    num_workers: int = field(default_factory=lambda: max(1, os.cpu_count() - 1))
+    num_workers: int = field(default_factory=lambda: max(1, (os.cpu_count() or 2) - 1))
     batch_size: int = 1
 
     # Device settings
@@ -104,6 +113,16 @@ class Config:
         # Create directories
         for dir_path in [self.audio_dir, self.transcripts_dir, self.cache_dir, self.logs_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
+
+        # ffmpeg_path and TRANSCRIBE_TOOL_FFMPEG are two spellings of the same
+        # override; resolve_binary() only reads the environment variable, so the
+        # two are kept in sync here. An explicit constructor argument wins.
+        if self.ffmpeg_path is None:
+            env_ffmpeg = os.environ.get("TRANSCRIBE_TOOL_FFMPEG")
+            if env_ffmpeg:
+                self.ffmpeg_path = Path(env_ffmpeg)
+        else:
+            os.environ["TRANSCRIBE_TOOL_FFMPEG"] = str(self.ffmpeg_path)
 
         # Adjust device settings
         # Note: MPS now works with Whisper via HuggingFace Transformers
