@@ -1,6 +1,12 @@
 # Transcribe Tool
 
+[![Install](https://github.com/antoinelemor/Transcribe-tool/actions/workflows/install.yml/badge.svg)](https://github.com/antoinelemor/Transcribe-tool/actions/workflows/install.yml)
+
 Audio extraction and transcription pipeline for YouTube, TikTok, and local files.
+
+Every install command below is executed on a clean Windows, macOS and Linux machine by
+[continuous integration](#continuous-integration) on each push. A green badge means the
+commands in this README work as written.
 
 ## Features
 
@@ -61,9 +67,12 @@ There is no need to change the machine-wide execution policy — `-ExecutionPoli
 that single `powershell.exe` process only.
 
 Installer options: `--all` / `--full` (all features), `--dev` (development tools), `--yes`
-(non-interactive). `install.ps1` additionally accepts `--cpu` (skip the CUDA torch build) and
-`--cuda-index <url>`, which takes a full wheel-index URL and defaults to
-`https://download.pytorch.org/whl/cu128`.
+(non-interactive). `install.ps1` additionally accepts `--cpu` (skip the CUDA torch build),
+`--cuda-index <url>` (a full wheel-index URL, default
+`https://download.pytorch.org/whl/cu128`), and `--python <path>` to pin a specific
+`python.exe` when several are installed — the `py` launcher resolves `-3` through the registry,
+which is not always the interpreter you want. `--python` can also be given as the
+`TRANSCRIBE_TOOL_PYTHON` environment variable.
 
 ### Manual Installation
 
@@ -331,6 +340,35 @@ lingua-language-detector, tqdm, keyring, rich
 | `rdata` | `pip install -e ".[rdata]"` | pyreadr (`.rds` export) |
 | `documents` | `pip install -e ".[documents]"` | pdfplumber, pypdf, python-docx, beautifulsoup4 |
 | `dev` | `pip install -e ".[dev]"` | pytest, black, ruff |
+
+## Continuous Integration
+
+`.github/workflows/install.yml` installs the package from scratch on GitHub-hosted runners using
+the exact commands printed above — not a simplified approximation of them — then exercises the
+result. It runs on every push and pull request, plus weekly, because the dependency graph is
+unpinned and an upstream release is the most likely thing to break a fresh install.
+
+| Job | What it proves |
+|-----|----------------|
+| **Windows / Python 3.12 / full** | `powershell -ExecutionPolicy Bypass -File .\install.ps1 --all` works on the recommended version |
+| **Windows / Python 3.13 / full** | the `audioop-lts` marker really covers the stdlib `audioop` removal that breaks `pydub` |
+| **Windows / Python 3.10 / core** | the declared `requires-python = ">=3.10"` floor is honest |
+| **Windows / install.bat shim** | the double-click path works from `cmd.exe`, and the file is genuinely CRLF |
+| **Windows / manual install** | the README's `py -3 -m venv` + `Activate.ps1` + `pip install -e ".[full]"` fallback works |
+| **ubuntu-latest, macos-latest** | `./install.sh --all` still works unchanged |
+
+Each Windows job then checks that:
+
+- `verify_installation.py` exits zero — every required dependency imports and FFmpeg is on PATH
+- `transcribe-tool` and `tt` resolve from `.venv\Scripts\`
+- activating the venv the way the README describes puts the CLI on PATH
+- `pyannote.audio`, `demucs` and `pyreadr` import (full installs only)
+- a real transcription runs end to end: FFmpeg synthesises a WAV, Whisper transcribes it, and a
+  CSV is written **without a BOM and without `CRCRLF` line endings**, so R's `read.csv()` and
+  the `.rds` export path stay correct
+
+To run the whole matrix manually, use the **Run workflow** button on the
+[Actions tab](https://github.com/antoinelemor/Transcribe-tool/actions/workflows/install.yml).
 
 ## License
 

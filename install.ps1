@@ -15,6 +15,8 @@
 #   --yes / -y            Answer yes to every prompt (unattended)
 #   --cpu                 Skip the CUDA build of PyTorch even if an NVIDIA GPU is present
 #   --cuda-index <url>    Override the PyTorch CUDA wheel index
+#   --python <path>       Use a specific python.exe instead of the py launcher
+#                         (also settable via the TRANSCRIBE_TOOL_PYTHON variable)
 #
 # Author: Antoine Lemor
 
@@ -127,11 +129,18 @@ $assumeYes = $false
 $forceCpu = $false
 $CudaIndex = 'https://download.pytorch.org/whl/cu128'
 $expectCudaIndex = $false
+$PythonExe = $null
+$expectPython = $false
 
 foreach ($arg in $args) {
     if ($expectCudaIndex) {
         $CudaIndex = $arg
         $expectCudaIndex = $false
+        continue
+    }
+    if ($expectPython) {
+        $PythonExe = $arg
+        $expectPython = $false
         continue
     }
     switch -Regex ($arg) {
@@ -140,6 +149,7 @@ foreach ($arg in $args) {
         '^(--yes|-Yes|-y)$'           { $assumeYes = $true }
         '^(--cpu|-Cpu)$'              { $forceCpu = $true }
         '^(--cuda-index|-CudaIndex)$' { $expectCudaIndex = $true }
+        '^(--python|-Python)$'        { $expectPython = $true }
         '^(-h|--help|-Help|/\?)$' {
             Write-Host "Usage: powershell -ExecutionPolicy Bypass -File .\install.ps1 [options]"
             Write-Host ""
@@ -148,6 +158,8 @@ foreach ($arg in $args) {
             Write-Host "  --yes, -y            Answer yes to every prompt (unattended)"
             Write-Host "  --cpu                Skip the CUDA PyTorch build even with an NVIDIA GPU"
             Write-Host "  --cuda-index <url>   PyTorch CUDA wheel index (default: $CudaIndex)"
+            Write-Host "  --python <path>      Use this python.exe instead of the py launcher"
+            Write-Host "                       (also settable as TRANSCRIBE_TOOL_PYTHON)"
             Write-Host "  -h, --help           Show this message"
             Write-Host ""
             exit 0
@@ -162,6 +174,11 @@ foreach ($arg in $args) {
 
 if ($expectCudaIndex) {
     Write-Bad "--cuda-index requires a URL argument"
+    exit 1
+}
+
+if ($expectPython) {
+    Write-Bad "--python requires a path to python.exe"
     exit 1
 }
 
@@ -190,11 +207,25 @@ Write-Rule
 $pyExe = $null
 $pyArgs = @()
 
-$pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
+# An explicit interpreter wins over discovery: the py launcher resolves -3 through
+# the registry, which is the wrong build when several Pythons are installed.
+if (-not $PythonExe) { $PythonExe = $env:TRANSCRIBE_TOOL_PYTHON }
+if ($PythonExe) {
+    if (-not (Test-Path -LiteralPath $PythonExe)) {
+        Write-Bad "The interpreter passed with --python does not exist: $PythonExe"
+        exit 1
+    }
+    $pyExe = (Resolve-Path -LiteralPath $PythonExe).Path
+    $pyArgs = @()
+    Write-Info "Using the interpreter given by --python / TRANSCRIBE_TOOL_PYTHON"
+}
+
+$pyLauncher = $null
+if (-not $pyExe) { $pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue }
 if ($pyLauncher) {
     $pyExe = $pyLauncher.Source
     $pyArgs = @('-3')
-} else {
+} elseif (-not $pyExe) {
     $candidates = @(Get-Command python.exe -All -ErrorAction SilentlyContinue)
     foreach ($candidate in $candidates) {
         if ($candidate.Source -notlike '*\WindowsApps\*') {

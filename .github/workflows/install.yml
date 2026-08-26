@@ -1,0 +1,231 @@
+name: Install
+
+# Runs the installation exactly as the README documents it, on a clean machine,
+# and then exercises the installed CLI end to end. If a badge on the README is
+# green, the copy-pasteable commands in it are known to work.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly: the dependency graph is unpinned, so upstream releases are the
+    # most likely thing to break a fresh install.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The headline Windows path: README "Quick Start (Windows)", verbatim.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows / Python ${{ matrix.python }} / ${{ matrix.mode }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.12 is the version the README recommends.
+          - python: '3.12'
+            mode: full
+          # 3.13 removed the stdlib audioop module that pydub needs; this proves
+          # the audioop-lts marker in pyproject.toml actually covers it.
+          - python: '3.13'
+            mode: full
+          # Core install: no diarization/demucs extras.
+          - python: '3.10'
+            mode: core
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Report free disk space
+        shell: pwsh
+        run: Get-PSDrive C | Select-Object Used, Free
+
+      # Chocolatey is preinstalled on the runner and its shim directory is
+      # already on PATH, so no PATH refresh is needed here.
+      - name: Install FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Run install.ps1 (as documented in the README)
+        shell: cmd
+        env:
+          # The py launcher resolves -3 through the registry, which is not the
+          # interpreter setup-python just provisioned. Pin it for the matrix.
+          TRANSCRIBE_TOOL_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 ${{ matrix.mode == 'full' && '--all' || '' }} --yes
+
+      - name: Verify installation
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe verify_installation.py
+          if ($LASTEXITCODE -ne 0) { throw "verify_installation.py reported failures" }
+
+      - name: Console scripts are on the venv PATH
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\transcribe-tool.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "transcribe-tool --version failed" }
+          .\.venv\Scripts\tt.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "tt --version failed" }
+
+      - name: Activate the venv the way the README says, then run the CLI
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          transcribe-tool --help
+          if ($LASTEXITCODE -ne 0) { throw "activation path is broken" }
+
+      - name: Optional extras import cleanly
+        if: matrix.mode == 'full'
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -c "import pyannote.audio, demucs, pyreadr; print('extras OK')"
+          if ($LASTEXITCODE -ne 0) { throw "an extra advertised by .[full] does not import" }
+
+      - name: End-to-end transcription
+        shell: pwsh
+        run: |
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=3" -ar 16000 -ac 1 sample.wav
+          .\.venv\Scripts\transcribe-tool.exe --transcribe sample.wav -m tiny -l en -f csv -o out
+          if ($LASTEXITCODE -ne 0) { throw "transcription failed" }
+          if (-not (Test-Path out\sample.csv)) { throw "no transcript was written" }
+          $bytes = [System.IO.File]::ReadAllBytes("out\sample.csv")
+          if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            throw "CSV has a UTF-8 BOM; R's read.csv() would break"
+          }
+          $text = [System.IO.File]::ReadAllText("out\sample.csv")
+          if ($text -match "`r`r`n") { throw "CSV has CRCRLF line endings" }
+          Write-Host "transcript written, no BOM, no CRCRLF"
+
+      - name: Report free disk space
+        if: always()
+        shell: pwsh
+        run: Get-PSDrive C | Select-Object Used, Free
+
+  # ---------------------------------------------------------------------------
+  # The least-technical Windows path: the double-clickable cmd.exe shim.
+  # ---------------------------------------------------------------------------
+  windows-bat:
+    name: Windows / install.bat shim
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install.bat has CRLF line endings
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("install.bat")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          $crlf = ([regex]::Matches($text, "`r`n")).Count
+          $lf = ([regex]::Matches($text, "`n")).Count
+          Write-Host "CRLF=$crlf LF=$lf"
+          if ($crlf -eq 0 -or $crlf -ne $lf) { throw "install.bat is not CRLF-only" }
+
+      - name: Run install.bat from cmd.exe
+        shell: cmd
+        run: .\install.bat --yes
+
+      - name: Verify installation
+        shell: cmd
+        run: |
+          .venv\Scripts\python.exe verify_installation.py
+          if errorlevel 1 exit /b 1
+
+      - name: Activate the venv from cmd.exe, as the README says
+        shell: cmd
+        run: |
+          call .venv\Scripts\activate.bat
+          transcribe-tool --version
+          if errorlevel 1 exit /b 1
+
+  # ---------------------------------------------------------------------------
+  # The README's Windows "Manual Installation" fallback, step for step.
+  # ---------------------------------------------------------------------------
+  windows-manual:
+    name: Windows / manual install
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: '3.12'
+
+      - name: py -3 -m venv .venv, activate, pip install -e ".[full]"
+        shell: pwsh
+        run: |
+          $env:PYTHONUTF8 = "1"
+          & "${{ steps.py.outputs.python-path }}" -m venv .venv
+          .\.venv\Scripts\Activate.ps1
+          python -m pip install --upgrade pip setuptools wheel
+          if ($LASTEXITCODE -ne 0) { throw "pip bootstrap failed" }
+          pip install -e ".[full]"
+          if ($LASTEXITCODE -ne 0) { throw "pip install -e .[full] failed" }
+          python verify_installation.py
+          if ($LASTEXITCODE -ne 0) { throw "verify_installation.py reported failures" }
+
+  # ---------------------------------------------------------------------------
+  # install.sh must keep working unchanged.
+  # ---------------------------------------------------------------------------
+  posix:
+    name: ${{ matrix.os }} / install.sh
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FFmpeg
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ffmpeg || true
+          else
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Run install.sh (as documented in the README)
+        run: ./install.sh --all --yes
+
+      - name: Verify installation
+        run: .venv/bin/python verify_installation.py
+
+      - name: Activate the venv the way the README says, then run the CLI
+        run: |
+          source .venv/bin/activate
+          transcribe-tool --version
+          tt --version
+
+      - name: End-to-end transcription
+        run: |
+          source .venv/bin/activate
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=3" -ar 16000 -ac 1 sample.wav
+          transcribe-tool --transcribe sample.wav -m tiny -l en -f csv -o out
+          test -f out/sample.csv
