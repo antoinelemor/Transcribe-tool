@@ -140,9 +140,21 @@ jobs:
           Write-Host "CRLF=$crlf LF=$lf"
           if ($crlf -eq 0 -or $crlf -ne $lf) { throw "install.bat is not CRLF-only" }
 
+      # This job deliberately does not pre-install FFmpeg, so the installer has
+      # to do it. It refreshes its own PATH afterwards, but each CI step is a
+      # new process -- replicate what "close and reopen the terminal" does.
       - name: Run install.bat from cmd.exe
         shell: cmd
         run: .\install.bat --yes
+
+      - name: Refresh PATH, as the installer tells the user to do
+        shell: pwsh
+        run: |
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          ($machine + ';' + $user) -split ';' |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+            ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
 
       - name: Verify installation
         shell: cmd
