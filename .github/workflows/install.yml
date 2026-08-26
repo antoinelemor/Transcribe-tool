@@ -172,6 +172,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
       - name: py -3 -m venv .venv, activate, pip install -e ".[full]"
         shell: pwsh
         run: |

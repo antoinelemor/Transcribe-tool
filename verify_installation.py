@@ -37,11 +37,13 @@ Author:
 Antoine Lemor
 """
 
+import os
 import sys
 import platform
 import importlib.util
 import subprocess
 import shutil
+import sysconfig
 
 try:
     from importlib import metadata as importlib_metadata
@@ -288,6 +290,21 @@ def check_gpu_support():
         return False
 
 
+def _resolve_console_script(name):
+    """Locate a console script belonging to the running interpreter."""
+    scripts_dir = sysconfig.get_path("scripts")
+    candidates = [name + ".exe", name] if sys.platform == "win32" else [name]
+
+    if scripts_dir:
+        for candidate in candidates:
+            path = os.path.join(scripts_dir, candidate)
+            if os.path.isfile(path):
+                return path
+
+    # Fall back to PATH for a system-wide (non-venv) installation.
+    return shutil.which(name)
+
+
 def check_cli_commands():
     """Check if CLI commands are available."""
     print("\nChecking CLI commands...")
@@ -296,9 +313,18 @@ def check_cli_commands():
     success = True
 
     for cmd in commands:
+        # Resolve against the running interpreter's own scripts directory, not
+        # PATH: install.ps1 deliberately never activates the venv, so a PATH
+        # lookup would report a missing CLI on an installation that is fine.
+        executable = _resolve_console_script(cmd)
+        if executable is None:
+            print(f"  {BAD} '{cmd}' command not found")
+            success = False
+            continue
+
         try:
             result = subprocess.run(
-                [cmd, "--version"],
+                [executable, "--version"],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
